@@ -1,761 +1,627 @@
 # Read-only REST data edge (`quack-rest`): design
 
 - **Issue:** starlake-ai/quack-on-demand#120
-- **Status:** DRAFT. This is a design only; nothing is implemented yet. Items marked **PARKED**
-  (§2.3) or **SPIKE** (§2.4) must be closed before the implementation phase that depends on them
-  (§12).
-- **Date:** 2026-09-25. Code references were checked against tree `6c69f55`.
+- **Status:** DESIGN, revised after the maintainer's answers on #120. Implementation is split into
+  **two PRs** (§12). An item marked **OPEN** (§2.4) or **SPIKE** (§2.5) must be closed before the
+  phase that depends on it starts.
+- **Date:** 2026-09-25, revision 2. Code references were checked against upstream `main` at
+  `0.9.7-SNAPSHOT`, which includes the 0.9.6 positional-reference mask fix (#114). Paths are
+  relative to `src/main/scala/ai/starlake/quack/` unless stated otherwise.
 
 ## 0. How to read this document
 
-| Sections | Content |
+| Section | Contents |
 |---|---|
-| §1 | Scope |
-| §2 | Every structural decision, who took it, and what is still open |
+| §1 | Framing: what this door adds over MCP, and scope |
+| §2 | The maintainer's answers, the two slices, open items and spikes |
 | §3 to §9 | The design |
 | §10 | Threat model |
-| §11 | Test design |
-| §12 | Phased implementation plan, with its gates |
+| §11 | Tests |
+| §12 | PR plan |
 | §13 | Code-style notes for the implementor |
-
-Every statement about existing code carries a `file:line` reference. Where reading the code could
-not settle how something behaves, it is listed as a **SPIKE** rather than assumed. Paths are
-relative to `src/main/scala/ai/starlake/quack/` unless stated otherwise.
-
-The draft was reviewed by an independent adversarial security pass and an independent test-design
-pass. Their findings are merged into the relevant sections, not appended.
+| Appendix A | Earlier author decisions this revision replaces, and why |
 
 ---
 
-## 1. Scope
+## 1. Framing and scope
 
-### Goals
+### 1.1 What this door adds over MCP
 
-1. Give read-only HTTP access to the tables and views of a tenant-db **of any kind registered on
-   QoD** (`ducklake`, `duckdb-file`, `memory`; see §6.7), discovered dynamically with
-   no per-endpoint configuration. To expose a curated contract, create a view and grant it.
-2. Run every data statement through the **same** policy pipeline as FlightSQL, the Quack door and
-   MCP. That pipeline covers ACL, CLS, RLS, filtered metadata, PAT attenuation, pool kill switches
-   and hibernation resume. The edge adds no policy and removes none.
-3. Be safe to expose directly to the internet:
-   - no superuser path;
-   - no SQL text controlled by the user;
-   - no unbounded use of resources;
-   - configuration that fails closed;
-   - nothing touched before the caller is authenticated **and** authorized.
-4. Stay consistent with the existing doors: a separate port, a config block with `QOD_*`
-   overrides, Tapir on Ember, the `ErrorResponse` envelope, and wiring through Main and
-   `ShutdownCoordinator`.
+The **governance** half is already solved. A stateless `POST /mcp` carrying a PAT bearer and a
+`run_sql` call goes through `routedExecutor`, with RBAC, RLS/CLS, audit, metering and PAT scoping
+applied, and `QOD_MCP_MAX_ROWS` as the row cap.
 
-### Non-goals (v1)
+What MCP lacks is an **HTTP contract**:
 
-- **Out of scope for this feature:**
-  - any write (POST, PUT, PATCH or DELETE);
-  - raw SQL over HTTP (the async statements API the issue mentions belongs in a separate issue);
-  - exact counts, ETag or caching;
-  - embedded resources, joins and aggregates.
-- **Deferred:**
-  - **Branch reads** are parked (P-2). The `branch` parameter name is reserved now.
-  - **Federated and attached catalogs** are parked (P-5). v1 exposes only the tenant-db's own
-    session catalog, whose name depends on the kind (§6.7).
-  - **Branch tenant-dbs** (rows with `branchOf` set) cannot be addressed through the `database`
-    path segment in v1. That follows from parking branch reads (P-2).
-  - **Parquet output** is parked (P-1).
+- GET resources that can be cached;
+- no SQL on the client side;
+- bodies that are not JSON.
+
+That gap is the whole reason for `quack-rest`. The edge is therefore a **thin translator**: it
+turns one HTTP GET into **one SELECT** and hands it to `routedExecutor`, the same way MCP `run_sql`
+does.
+
+**Design rule:** anything that looks like policy (grants, masking, row filters, quotas, pool
+authorization) belongs in the existing pipeline, not in the edge. When a spike (§2.5) exposes a
+policy gap, the fix goes into the validator or the rewriter, never into a special case in the edge.
+
+### 1.2 Scope
+
+- **In scope:** read-only access to the tables and views of a tenant-db of **every kind QoD
+  registers** (`ducklake`, `duckdb-file` and `memory`, see §6.6). Objects are discovered
+  dynamically, with no per-endpoint configuration. To expose a curated contract, create a view and
+  grant it.
+- **Out of scope:**
+  - writes;
+  - raw SQL over HTTP;
+  - exact counts, joins and aggregates;
+  - federated or attached catalogs (O-3);
+  - branch reads (later, per Q7). A branch tenant-db returns 404.
 
 ---
 
-## 2. Decisions and open items
+## 2. Decisions
 
-The issue's eight open questions are addressed to the upstream maintainer, who **has not answered
-yet**. The issue author, who will also implement the feature, took the decisions below during the
-design interview. Each stays **proposed** until the maintainer confirms it on #120. If the
-maintainer answers differently, only the sections listed under "Impacts" re-open.
+### 2.1 The maintainer's answers (binding)
 
-### 2.1 Decided by the author, pending maintainer confirmation
-
-| # | Question (issue #120) | Decision | Impacts |
+| # | Question | Answer | Where |
 |---|---|---|---|
-| Q2 | How a PAT is admitted to REST | **Explicit opt-in.** A new PAT axis, `restAccess`, defaults to `false`, so an existing PAT can never be replayed against the new door. | §5.2, §8.2 |
-| Q3 | X-API-Key or HTTP Basic | **Neither.** Only `Authorization: Bearer <PAT or tenant OIDC JWT>`. | §5.1 |
-| Q4 | ACL disabled | **Refuse to boot** when `quack-rest.enabled` is set and `acl.enabled=false`. | §7.2 |
-| Q5 | Flag masked columns | **No flag.** Table detail shows only what the caller would receive. | §6.3 |
-| Q7 | Branch reads | **Later.** `branch` is reserved, and in v1 it returns 400 `unsupported_parameter`. | P-2 |
-| Q8 | JSON shape | **Array of objects**, with metadata in headers. | §6.5 |
-| - | Abuse protection | **Minimal built-in controls:** a per-IP failed-auth throttle, a per-user concurrency cap and hard size, time and row caps. Volumetric rate limiting belongs to the reverse proxy or WAF, and the operator documentation says so. | §7.3, §7.4 |
-| - | Endpoint declaration | **Tapir**, in their own endpoint object, served on the new port, **plus a published OpenAPI** document at `GET /api/v1/openapi.json`. These endpoints are not registered in `EndpointModules`, so the CLI-parity, MCP-coverage and admin-OpenAPI guards do not apply to them. | §6.6 |
-| - | Statement attribution | **Add a `source` column** to `qodstate_stmt_history` and a `source` tag to the statement metrics. Values are `rest`, `flightsql`, `quack` and `mcp`. | §8.1 |
-| - | Client IP behind a proxy | **A trusted-proxy CIDR list.** `X-Forwarded-For` is honoured only when the socket peer is in `trustedProxies`, which is empty by default. | §7.3 |
+| Q1 | Path prefix and versioning | `/api/v1/...` on its own port. The admin API stays unversioned. | §6 |
+| Q2 | PAT scoping | **Reuse the existing `tools` axis** with the reserved tool name **`rest`**, checked the same way `McpRoutes` calls `allowsTool` (`mcp/McpRoutes.scala:120,143`). No new column and no Liquibase change. A PAT with no `tools` restriction is admitted. A PAT restricted to a list that does not include `rest` is refused. | §5 |
+| Q3 | Credentials | **PATs only** in slice 1. **Never** the static `X-API-Key` on this edge. **No HTTP Basic**: it would put database passwords into n8n workflow JSON, and PATs already cover the low-code case. **OIDC bearer is deferred to slice 2**: the external JWT providers live on the FlightSQL edge's `AuthenticationService`, and nothing on the HTTP side validates them today. | §5, §12 |
+| Q4 | ACL disabled | **A boot warning, not a refusal**, shown on the banner in the same style as the existing `SQL ACL : ENABLED/DISABLED` line (`Banner.scala`, `aclLine`). | §8.3 |
+| Q5 | Masked columns | Shown as ordinary columns. Advertising which columns are masked leaks the shape of the policy for no functional gain. | §6.2 |
+| Q6 | Reserved parameter names | Acceptable for this phase. Document the limitation, and return **400 `reserved_column`** when a filter names a reserved parameter. Never ignore it silently. | §6.1 |
+| Q7 | Branches | Later. The `branchOnly` restriction and the MCP `branchTarget` seam make this a small follow-up. Meanwhile a `branchOnly` token **is** admitted, because the edge never writes. | §5 |
+| Q8 | JSON body shape | An array of objects, with metadata in headers. | §6.4 |
 
-### 2.2 Designer defaults (not raised in the interview; reviewer to confirm)
+### 2.2 The maintainer's implementation constraints (binding)
 
-| # | Question | Default | Why |
-|---|---|---|---|
-| Q1 | Path prefix and versioning | `/api/v1/tenant/{tenant}/database/{tenantDb}/...` on the dedicated port, as the issue proposes. | A separate listener cannot collide with the manager's `/api`, and `v1` leaves room for a breaking change later. |
-| Q6 | A column whose name is a reserved parameter | **Cannot be filtered in v1.** This is documented; the workaround is a view that renames the column. | Every escape syntax adds grammar for a rare case, and one can be added later without breaking anything. |
-| - | JWT issuers accepted | **Only the path tenant's own OIDC provider** (`TenantOidcRegistry.forTenant`). The global HS256 `jwt` provider and the global OIDC providers are **not** accepted on REST. | A global IdP's usernames are not tenant-scoped, so the path would choose the tenant (§5.3). See P-9. |
-| - | Non-DuckLake tenant-dbs (`duckdb-file`, `memory`) | Served, with the same endpoints, grammar, formats and policies. `asOf*` returns 400 `time_travel_unsupported` (only after authorization, §4). No snapshot header is sent, and pagination is only best-effort. The full rules per kind are in §6.7. | These databases have no snapshots, but reads are still useful. |
-| - | Unknown query parameter | 400 `unknown_column`, never silently ignored. | A typo in a filter must not return a bigger, unfiltered result. |
-| - | Token in the URL (`?access_token=`) | Never accepted. | URLs end up in proxy logs, browser history and `Referer` headers. |
-| - | Duplicate column in `select` | 400 `invalid_parameter`. | A JSON object cannot carry two keys with the same name. |
+1. **SQL generation goes through the existing validator and rewriter path.**
+   - Build the statement as text and hand it to `routedExecutor` exactly as MCP does. That way
+     `StatementValidator`, the RLS/CLS rewriter and the router all see an ordinary statement.
+   - **Do not add a second quoting or identifier helper.** Use `model/SqlLiterals.scala`.
+   - A fresh SQL builder is how the positional-reference mask bypass fixed in 0.9.6 (#114) would
+     come back.
+2. **Discovery fails closed.** With `acl.filteredMetadata` on, the schema, table and column
+   listings are filtered by the caller's grants. An object without a grant returns **the same 404
+   as a missing one**. A spec in the style of `RbacTenantScopeSpec` pins this behaviour.
+3. **No superuser fallback anywhere.** A missing or unresolvable credential gets 401.
+4. **Every generated statement is a SELECT, routed as READ.**
+5. **History and audit attribute the statement to the REST edge the same way the native front
+   door does.** The edge passes `source = "rest"` to `FlightSqlRouter.executeWith`. That sets the
+   audit origin and `SessionOpened` (`edge/FlightSqlRouter.scala:390-409`). History rows carry no
+   source today, and this design does not add one.
+6. **OpenAPI.** The endpoints are declared with Tapir, so `GenOpenApi` and `OpenApiFreshnessSpec`
+   pick them up. They are excluded from the CLI parity gate (`cli/tests/test_rest_parity.py`) the
+   same way the SCIM routes are, as a machine-to-machine surface.
+7. **Errors** use the existing `ErrorResponse` shape and the codes listed in the issue (§4.2).
+8. **Tests:**
+   - a pure spec for the parser and the renderer;
+   - an edge spec over the routed-executor seam, without the wire;
+   - one end-to-end spec against a live pool, in the style of the existing front-door specs.
 
-### 2.3 PARKED: explicitly open, each with a default recommendation
+   All of them must stay **green under `sbt test` while a manager is running on `:20900`**
+   (§11.4).
 
-| Id | Item | Recommendation | Blocks |
-|---|---|---|---|
-| P-1 | **Parquet output.** No Parquet writer is on the classpath: `project/Dependencies.scala` has Arrow but not parquet-java. The options are to add parquet-java (a heavy, Hadoop-shaped dependency), to have the node run `COPY ... TO` into a temporary object and stream it back, or to defer. | **Defer to v1.1.** v1 serves `json`, `csv` and `arrow`; `format=parquet` returns 406. | nothing |
-| P-2 | Branch reads (`branch=<name>`) | Add in v1.1, using the same resolution as FlightSQL: `BranchService.resolveTarget`, called after authorizing the parent pool (`Main.scala:1198-1219`). | nothing |
-| P-3 | Maintainer confirmation of §2.1 and §2.2 | Phases P0, P1 and P3 of §12 do not depend on those decisions and can start now. | P2, P4 and later phases |
-| P-4 | **Durable node-side cancellation.** The token timeout in `routedExecutor` is a bounded wait, not a cancellation (`Main.scala:1507-1520`, see the comment at `:1496-1506`). The node cancel handle is attached only once streaming starts (`edge/ActiveStatementRegistry.scala`, `attachCancel`). | Do not add cancellation in this feature. Mitigation: the per-user slot is released only when the node call has really finished (§7.4), so repeated timeouts cannot pile up orphaned work on the node. | nothing |
-| P-5 | Exposing federated or attached catalogs (`sql` sources and typed `iceberg_rest` sources, which are attached to a tenant-db's nodes and governed by ACL through their alias) | **Out of scope for v1** (author's decision). Every name is qualified with the session catalog (§6.7), so these catalogs can be neither addressed nor listed. Adding them needs three things. (1) A path level, `.../database/{tenantDb}/catalogs/{alias}/schemas/...`. (2) A filtered listing for attached catalogs: `MetadataFilterRewriter.readGrants` only admits grants on the session catalog (`edge/meta/MetadataFilterRewriter.scala:223-228`), so this needs either an extension there or a listing derived from the `EffectiveSet`. (3) A spike on `AT (VERSION => n)` against Iceberg and on the source's reachability (a source that cannot be reached leaves its catalog absent on a node that is otherwise healthy). Reads would then carry no QoD snapshot unless that spike says otherwise. | nothing |
-| P-6 | Throttle state across HA replicas | Keep it per replica, in memory, and document it. With N replicas, the effective failed-auth budget is N times the configured value. | nothing |
-| P-7 | A requests-per-second budget per user | Later. The `qodstate_pat.rate_per_min` column is already reserved and unused (`src/main/resources/db/changelog/0033-pat-scope.yaml:24-25`). | nothing |
-| P-8 | Advertising the REST port in `/api/config/client` (for the UI connect panel and the CLI) | Only if the UI grows a REST connect snippet. | nothing |
-| P-9 | **Binding JWTs to an immutable claim.** Today the username is `preferred_username`, then `email`, then `sub`, and `email_verified` is not checked (`edge/auth/OidcBearerAuthenticator.scala:96-100`). Within the tenant's own IdP this is the trust FlightSQL already places in that IdP. | For v1, accept the tenant IdP as FlightSQL does, and document that `preferred_username` must not be user-editable in that IdP. Later: bind `sub` to the SCIM `external_id` (Liquibase `0036`). Also later: whether global-provider JWTs should ever be accepted, and if so with a mandatory tenant claim. | nothing |
+### 2.3 The two slices
 
-### 2.4 SPIKES: verify in code before the dependent phase
+**Slice 1 (PR 1):**
 
-Each spike ends in a test that stays in the suite.
+- **Authentication and routing:** PAT bearer auth. The path tenant is checked against the token's
+  tenant, mirroring `McpToolArgs.tenantOf`. `pool` is checked against the `pools` axis. The default
+  pool is chosen as in `run_sql`.
+- **Endpoints:** the four endpoints, **JSON and CSV** only.
+- **Query parameters:** `select`, the filter operators and the `not.` prefix, `order`, `limit`,
+  `offset`, and `asOf`/`asOfTag`/`asOfTs` with the preview endpoint's rules.
+- **Headers and errors:** `X-QoD-Snapshot`, `Content-Range` and `X-QoD-Truncated`, plus
+  `order_required` when `offset > 0` comes without `order`.
+- **Config:** a `quack-rest` block with `QOD_REST_*` overrides, modelled on `quack-native`, on
+  port 31339.
+- **Limits:**
+  - row cap `min(maxRows, PAT maxRows, limit)`;
+  - timeout `min(stmtTimeoutSec, PAT stmtTimeoutMs)`;
+  - a cold-start hold that reuses `resumeHoldTimeoutSec`, then 503 with `Retry-After`.
+- **Helm:** the new port and a Service.
+- **Docs:** the block in the configuration reference.
 
-| Id | Question | Why it matters | Blocks |
-|---|---|---|---|
-| S1 | Do `ColumnPolicyRewriter` and `RowPolicyRewriter` **keep** `AT (VERSION => n)` on a three-part table reference **and** still apply the policy? The ACL parser strips the clause before parsing (`ai/starlake/acl/parser/SqlParser.scala:47-60`); the CLS and RLS parsers have not been checked. | Every `/rows` statement carries `AT` (§6.4). If a rewriter drops the clause, pages become inconsistent. If it cannot parse the clause, the statement is denied fail-closed and no data is returned. The worst case is a rewriter that parses the statement but skips the policy. | P4 |
-| S2 | Does DuckLake accept `AT (VERSION => n)` on a **view**? | Consistent pagination over views. If views do not support it, they are served at the current snapshot, `asOf*` on a view returns 400 `time_travel_unsupported`, and no snapshot header is sent. That weakens the contract for exactly the objects §1 recommends exposing, so the maintainer must be told either way. | P4 |
-| S3 | After rewriting, does a `WHERE` or `ORDER BY` on a CLS-masked column act on the **raw** value or the **masked** one? | If it acts on the raw value, a filter such as `ssn=like.123*` becomes an oracle on the unmasked data, observable from which rows come back. If so, the renderer places filters and ordering **outside** a derived table whose inner `SELECT *` the CLS rewriter masks, and S3 must prove that the inner `*` really is masked. If that cannot be made safe, masked columns are marked non-filterable in the probe (§6.3) and filtering on them returns 400 `invalid_filter`, while detail still does not reveal the masking (Q5). | P4 |
-| S4 | Does `AuthenticationService.authenticateBearer` return `Left` when the chain is empty? How is `exp` exposed? It is flattened as a `Date.toString` in `AuthenticatedProfile.claims`, not as epoch seconds. | `EdgeHandshake` **trusts the client** when no provider is configured (`edge/EdgeHandshake.scala:89`). The JWT and OIDC authenticators accept a token that has no `exp`. The REST edge must not inherit either behaviour. | P5 |
-| S5 | Does `MetadataFilterRewriter` narrow the exact `information_schema` queries of §6.2 **for each of the three kinds** (session catalog `<catalogAlias>` or `memory`), with no row leaking from other attached catalogs? | Listings must show only readable objects. The admin REST catalog handlers (`ondemand/api/CatalogHandlers.scala:84,91`) do **not** filter per grant, so they must not be reused here. | P5 |
-| S6 | Which Ember settings does http4s 0.23.24 (`project/Versions.scala:4`) provide: `withMaxHeaderSize`, `withRequestHeaderReceiveTimeout`, `withIdleTimeout`, `withMaxConnections`? Is the URI length bounded by the header limit? | Protection against slowloris and oversized requests (§7.1). | P5 |
-| S7 | Does the **fully qualified** `"<catalog>"."<schema>"."<name>"` form (§6.7) confine every statement to the tenant catalog, for each kind? That includes `memory`, whose session catalog *is* DuckDB's built-in `memory` catalog (`model/DuckDbCatalogs.scala:13`). Is there no resolution into any other built-in catalog or system schema? | §6.4 relies on the three-part form to confine every statement to the tenant catalog. `USE` only sets a default; it does not constrain resolution. | P4 |
-| S8 | What does a pathological LIKE pattern (4 KiB, many wildcards, with and without `ESCAPE`) cost on the pinned DuckDB, measured? | Node CPU is shared by the whole pool, and P-4 means no cancellation. The measurement sets the wildcard cap in §6.4. | P3 |
+**Slice 2 (PR 2):**
+
+- OIDC bearer (§5.3).
+- **Arrow IPC and Parquet**, streamed.
+- CORS from `corsAllowedOrigins`.
+- Prometheus metrics.
+- *(Proposed, O-1)* abuse controls.
+
+### 2.4 OPEN items (each needs an answer; a recommendation is given)
+
+**O-1. Abuse controls for direct internet exposure.** Blocks: the scope of slice 2.
+
+The maintainer's slices do not include a per-IP failed-auth throttle or a per-user concurrency cap.
+Both are HTTP-layer resource controls, not data policy. Without them, slice 1 relies on the
+deployment for rate limiting.
+
+Guessing a PAT is infeasible: tokens are 32 random bytes (`ondemand/state/PatStore.scala:138-141`).
+What remains is load:
+
+- every bad token costs one indexed lookup on the control plane;
+- a valid token can run heavy statements concurrently, bounded only by the row and time caps;
+- the time cap is a bounded wait, not a cancellation (O-4).
+
+*Recommendation:* propose these controls for slice 2, in the form sketched in §7.3. Until they
+land, the operator documentation states that an internet-facing `quack-rest` must sit behind a
+reverse proxy or WAF that rate-limits per client and per `Authorization` value.
+
+**O-2. Where the configuration reference lives.** Blocks: the slice 1 docs task.
+
+`.gitignore` says the docs site moved to the `starlake-docs` repo. `genConfigDocs` generates the
+reference from `@ConfigField` annotations (`GenConfigDocsSpec`).
+
+*Recommendation:* slice 1 adds the `@ConfigField` annotations and the `ConfigRegistry` entry, so
+the generated reference contains the block. Open a companion PR on `starlake-docs` only if the
+maintainer wants a hand-written section there.
+
+**O-3. Federated or attached catalogs (`sql`, `iceberg_rest`).** Blocks: nothing.
+
+*Recommendation:* keep them out of scope. Adding them later needs three things:
+
+- a `catalogs/{alias}` path level;
+- a filtered listing for attached catalogs, because `MetadataFilterRewriter.readGrants` only admits
+  grants on the session catalog (`edge/meta/MetadataFilterRewriter.scala:230-235`);
+- a spike on Iceberg time travel.
+
+**O-4. Durable node-side cancellation.** Blocks: nothing.
+
+The token timeout in `routedExecutor` is a bounded wait, not a cancellation (`Main.scala:1509-1520`
+and the comment above it).
+
+*Recommendation:* leave this unchanged and out of this feature. §7.2 at least guarantees that the
+edge closes a late result.
+
+### 2.5 SPIKES (verify in code before the dependent phase; each ends in a test that stays)
+
+All seven spikes block slice 1.
+
+| Id | Question | What happens if the answer is bad |
+|---|---|---|
+| S1 | Do `ColumnPolicyRewriter` and `RowPolicyRewriter` keep `AT (VERSION => n)` on a three-part table reference **and** still apply the policy? The ACL parser strips the clause before parsing (`ai/starlake/acl/parser/SqlParser.scala:47-60`). | Fix it in the rewriter (constraint 1). The edge does not work around it. |
+| S2 | Does DuckLake accept `AT (VERSION => n)` on a **view**? | Serve views at the current snapshot. `asOf*` on a view gets 400 `invalid_selector` and no snapshot header. Tell the maintainer. |
+| S3 | After rewriting, does a `WHERE` or `ORDER BY` on a masked column see the **raw** value or the masked one? A FlightSQL client can already write this SQL by hand. | It is a rewriter issue, fixed in the rewriter (constraint 1). The pinned test (P2) blocks slice 1 until it passes. |
+| S5 | Does `MetadataFilterRewriter` narrow the §6.2 `information_schema` queries for **every kind**? The session catalog is `<alias>` for most kinds and `memory` for the `memory` kind. | Fix it in the rewriter. |
+| S6 | Which Ember settings exist in the pinned http4s: `withMaxHeaderSize`, `withRequestHeaderReceiveTimeout`, `withIdleTimeout`, `withMaxConnections`? | Use the closest equivalents and document the gap. |
+| S7 | Does the fully qualified `"<catalog>"."<schema>"."<name>"` keep name resolution inside the tenant catalog for every kind? That includes `memory`, whose session catalog is DuckDB's built-in `memory` (`model/DuckDbCatalogs.scala:13`). | Report it to the maintainer and fix it in the validator (constraint 1). |
+| S8 | How expensive is the worst LIKE pattern the caps allow, measured on the pinned DuckDB? | Lower the wildcard cap (§6.3). |
 
 ---
 
 ## 3. Architecture
 
 ```
-                         :31339 (quack-rest, TLS by default)
-client --HTTPS--> RestEdgeServer (Ember + security middleware)
-                    |  1. method / size / body gates           -> 400/405/414/431
-                    |  2. ClientAddress (peer / trusted XFF)
-                    |  3. AuthThrottle.check(ip)                -> 429
-                    |  4. Tapir decode (RestEdgeEndpoints)       -> 400/404
-                    v
-                  RestEdgeHandlers
-                    |  5. RestAuth.authenticate(bearer, tenant)        -> 401/403
-                    |  6. resolve tenant-db + pool (in-memory registry only)
-                    |  7. authorize: authorizeHandshake(.., superuserAdmissible=false) -> 403/404
-                    |  8. UserLimiter.acquire(tenant, userId)           -> 429
-                    |  9. SnapshotSelector (control-plane JDBC)         -> 400/404/410/422
-                    | 10. schema probe  (SELECT * ... LIMIT 0)  --+
-                    | 11. RowsQuery.parse -> RowsSql.render        |  both through
-                    | 12. data statement                         --+  RoutedExecutor (source="rest")
-                    v
-                  RestResultEncoder (json | csv | arrow), streamed; one finalizer closes the
-                  Routed and releases the slot
+client --HTTP(S)--> RestEdgeServer (Ember, :31339)          transport limits, headers, request id
+                      |
+                      v
+                    RestEdgeHandlers
+                      1. PAT bearer -> principal (tools axis 'rest', tenant check)   401 / 403
+                      2. tenant-db + pool  (McpDataTools.poolKeyFor rules)            404 / 403
+                      3. snapshot selector (preview rules)                             400/404/410/422
+                      4. schema probe      SELECT * ... LIMIT 0  --+
+                      5. RestQuery.parse -> RestSql.render          |  PreviewExecutor = routedExecutor
+                      6. one SELECT                                --+  (ExecCaller, source = "rest")
+                      7. encode JSON | CSV (slice 2: Arrow, Parquet), close Routed
 ```
 
-The feature lives in package `ai.starlake.quack.edge.rest`, laid out like `edge/quack/`:
+The code lives in a new package, `edge/rest/`, laid out like `edge/quack/`:
 
-| File | Responsibility | Pure? |
-|---|---|---|
-| `RestEdgeServer.scala` | Ember shell: TLS, limits, security headers, CORS, request id. `start`/`stop` have the same shape as `QuackFrontDoorServer`. | no |
-| `RestEdgeEndpoints.scala` | Tapir endpoint values and the OpenAPI document. | yes |
-| `RestEdgeHandlers.scala` | Request orchestration, steps 5 to 12. | no |
-| `RestAuth.scala` | Turns a bearer into a `RestPrincipal` (PAT or tenant JWT). | no (I/O injected) |
-| `RowsQuery.scala` | Query parameters to an AST, with every check that needs no schema. | **yes** |
-| `RowsSql.scala` | AST plus probed schema to SQL text. The only place `/rows` SQL is built. | **yes** |
-| `RestResultEncoder.scala` | Encodes an `ArrowReader` into a byte stream per format. | yes (over a reader) |
-| `AuthThrottle.scala`, `UserLimiter.scala`, `ClientAddress.scala` | Abuse controls (§7). | yes (clock injected) |
+| File | Responsibility |
+|---|---|
+| `RestEdgeServer.scala` | The Ember shell: TLS, transport limits, security headers and the request id. Its `start`/`stop` follow the same shape as `QuackFrontDoorServer`. |
+| `RestEdgeEndpoints.scala` | Tapir endpoint values, registered in `ondemand/api/EndpointModules.scala` (§8.4). |
+| `RestEdgeHandlers.scala` | Steps 1 to 7. Takes a `CatalogPreviewHandlers.PreviewExecutor` as a constructor parameter; that parameter is the seam the edge spec stubs. |
+| `RestQuery.scala` | **Pure.** Parses query parameters into an AST and runs every check that does not need the schema. |
+| `RestSql.scala` | **Pure.** Renders the AST plus the probed schema into SQL text, using `SqlLiterals` only. |
+| `RestResultEncoder.scala` | Turns an `ArrowReader` into JSON or CSV. Slice 2 adds Arrow and Parquet. |
 
-Outside the package:
+The edge deliberately has **no** authorization step of its own, no second quoting helper and no
+policy. Those already exist elsewhere:
 
-- `RestEdgeConfig` goes in `Config.scala`, next to `QuackNativeConfig`.
-- Wiring goes in `Main.scala`, next to the Quack door (`Main.scala:1230-1268`).
-- `routedExecutor` is **extracted** from `Main` into a class, `ondemand/api/RoutedExecutor.scala`
-  (§8.1). This is a prerequisite: its security properties are otherwise untestable (§11).
+- `routedExecutor` (`Main.scala:1384`) runs `authorizeHandshake`, the `pools` axis, `branchOnly`,
+  attenuation and the PAT timeout.
+- `FlightSqlRouter.execute` runs ACL, CLS, RLS, filtered metadata and hibernation resume.
 
 ---
 
-## 4. Request lifecycle (normative)
+## 4. Request lifecycle
 
-The steps run in this order; each one either continues or answers with the status listed.
+### 4.1 Steps, in normative order
 
-**Invariant:** until step 7 has succeeded, the edge makes **no catalog read, no node call, no pool
-wake-up and no snapshot lookup**. Steps 5 and 6 touch only the credential store and the in-memory
-registry. The table in §10 depends on this ordering.
-
-1. **Gates.**
-   - `GET` is accepted. `OPTIONS` is accepted only when CORS is configured. Everything else,
-     `HEAD` included, gets 405 with `Allow`.
-   - A `GET` carrying `Content-Length > 0` or `Transfer-Encoding` gets 400 with
-     `Connection: close`, because an unread body could desynchronise a reused proxy connection.
-   - Ember returns 431 for oversized headers and 414 for an oversized URI (§7.1).
-2. **Client address.** Determined as in §7.3.
-3. **Throttle.** An IP that is currently blocked gets 429 `too_many_auth_failures` with
-   `Retry-After`, before any credential is examined.
-4. **Decode.** Path segments must match QoD's identifier rule, otherwise 404. A malformed name
-   cannot exist, so this is not a 400.
-5. **Authenticate** (§5). Failure gives 401 `unauthorized`, or 403 for `tenant_forbidden` /
-   `rest_access_denied`. Every one of these counts toward the throttle (§7.3).
-6. **Resolve the tenant-db and pool** from the in-memory registry. The pool is the `pool` parameter
-   if given, otherwise `PoolPicks.readPoolKey` (`ondemand/api/PoolPicks.scala:26`).
+1. **Transport gates** (`RestEdgeServer`):
+   - Only `GET` is accepted; everything else gets 405. Slice 2's CORS adds `OPTIONS`.
+   - A `GET` that carries `Content-Length > 0` or `Transfer-Encoding` gets 400 with
+     `Connection: close`. The body is never read.
+   - Ember's header and URI limits apply (§7.1).
+2. **Authenticate** (§5). Failures get 401 `unauthorized` or 403 `forbidden`.
+3. **Resolve the target** with the same rules as MCP `run_sql` (`mcp/McpDataTools.scala:169-184`):
    - A tenant-db that is unknown, outside the PAT `databases` axis, or a branch (`branchOf` set,
-     P-2) gets 404 `not_found`.
-   - An unknown pool also gets 404 `not_found`.
-7. **Authorize**, before doing anything else. The edge calls
-   `authorizeHandshake(tenant, pool, username, jwtRoles, jwtGroups, superuserAdmissible = false)`
-   (`ondemand/PoolSupervisor.scala:3221`) and checks the PAT `pools` axis.
-   - A user that is not provisioned or is disabled, a disabled tenant or pool, or a superuser row
-     gets 403 `forbidden`, with one fixed message.
-   - The resulting `EffectiveSet` is passed on to the executor, so it is not authorized a second
-     time (§8.1).
-8. **Acquire the per-user slot** (§7.4). If none is free, 429 `too_many_requests`.
-9. **Resolve the snapshot**. This applies only to DuckLake, on `/rows` and on table detail.
-   - Resolution uses `SnapshotSelector.resolve` with `DuckLakeCatalogReader`
-     (`ondemand/catalog/DuckLakeCatalogReader.scala:241`) over control-plane JDBC. No node is
-     involved.
-   - Errors are mapped by `SnapshotSelector.httpError`, except that a tag-not-found message never
-     echoes the tag.
-   - This step runs after authorization, so it reveals nothing to a caller who has no access to the
-     pool.
-10. **Probe the schema** (§6.3). A missing object and an unreadable object both get 404
-    `not_found`, with the same body and headers.
-11. **Parse and render** (§6.4). Invalid input gets 400.
-12. **Execute and stream** (§6.5).
-    - A resuming pool gets 503 `pool_resuming` with `Retry-After`.
-    - A timeout gets 504 `statement_timeout`.
-    - A node error gets 502 `upstream_error`, with a generic message and the request id.
+     Q7) gets 404 `not_found`.
+   - A `pool` that does not exist, or that serves another database, gets 404 `not_found`.
+   - With no `pool`, the default is `PoolPicks.readPoolKey`.
+   - The `pools` axis itself is enforced inside `routedExecutor` (`Main.scala:1403-1421`), which
+     returns 403 `acl_denied`.
+4. **Snapshot**, following the preview endpoint's rules (`ondemand/api/CatalogPreviewHandlers.scala`):
+   - Time travel requires a DuckLake tenant-db. `asOf*` on any other kind gets 400 `invalid_kind`,
+     the same code the preview uses.
+   - On DuckLake, the snapshot comes from `SnapshotSelector.resolve`, and errors are mapped by
+     `SnapshotSelector.httpError`. With no selector, `DuckLakeCatalogReader.maxSnapshotId()` is
+     used.
+   - One deliberate difference from the preview: a tag-not-found message never echoes the tag.
+5. **Probe the schema** (§6.2). A missing object and an object without a grant get the same 404.
+6. **Parse and render** (§6.3). Invalid input gets 400.
+7. **Execute and encode**, with the timeout (§7.2), the cold-start hold (§7.4) and node errors.
 
-Every response carries `X-Request-Id`, a freshly generated UUID. That includes errors generated by
-Ember and Tapir themselves. A request id supplied by the client is never echoed. The error envelope
-is the existing `ErrorResponse(error, message)` (`ondemand/api/Dtos.scala:299`).
+Every response carries `X-Request-Id`, a fresh UUID. That includes responses generated by Ember and
+Tapir themselves. A client-supplied request id is never echoed back.
+
+### 4.2 Error codes
+
+All errors use `ErrorResponse(error, message)` (`ondemand/api/Dtos.scala:299`).
+
+| Status | Code(s) |
+|---|---|
+| 400 | `invalid_filter`, `unknown_column`, `reserved_column`, `order_required`, `invalid_selector`, `invalid_kind`, `invalid_parameter` |
+| 401 | `unauthorized`, with one body for every cause: a missing, malformed, unknown, revoked or expired PAT, or a superuser PAT |
+| 403 | `forbidden` (the PAT does not allow tool `rest`, or its tenant is not the path tenant); `acl_denied` (from the executor: pool not permitted, handshake refused) |
+| 404 | `not_found`. A missing object and an object without a grant get identical responses. |
+| 406 | `unsupported_format` (in slice 1, anything other than `json` or `csv`) |
+| 410 / 422 | from `SnapshotSelector.httpError` |
+| 503 | `pool_resuming` (with `Retry-After`) or `pool_unavailable` |
+| 504 | `statement_timeout` |
+| 502 | `upstream_error`, with a generic message and the request id. Node exception text is never passed through. |
 
 ---
 
-## 5. Authentication
+## 5. Authentication (slice 1: PATs only)
 
-### 5.1 Credential intake
-
-- Only the `Authorization` header is read.
-  - The scheme must be `Bearer` (matched case-insensitively), followed by one space and a token of
-    1 byte to 8 KiB.
-  - A request with more than one `Authorization` header gets 401.
-  - Cookies, `X-API-Key`, `Basic` and any token in the query string are never read.
-- A token beginning with `qod_pat_` (`PatStore.TokenPrefix`, `ondemand/state/PatStore.scala:425`)
-  takes the **PAT path**. Any other token takes the **JWT path**. The prefix is checked before any
-  I/O, and there is no fallback from one path to the other.
-- Every 401 has the same body: `{"error":"unauthorized","message":"missing or invalid credential"}`.
-  It is the same for an unknown tenant, a bad, expired or revoked token, a disabled owner and a
-  superuser token.
-- **Accepted residual:** the JWT path answers faster for an unknown tenant, because no provider
-  runs. Tenant names are not secret: they appear in URLs and connection strings. Nimbus rate-limits
-  JWKS refetches per provider on an unknown `kid` (at most once every 30 s by default), so random
-  `kid` values cannot cause a fetch storm.
-
-### 5.2 PAT path
-
-1. `PatAuthenticator.resolve(token)` (`ondemand/auth/PatAuthenticator.scala:72`) checks the hash,
-   revocation, expiry and that the owner is enabled. If it returns `None`, the answer is 401.
-2. **No superuser.** An owner with `user.tenant == None` gets 401, not 403, so a caller cannot tell
-   that they hold a valid superuser token.
-3. **Tenant binding.** The owner's tenant must equal the path tenant after the lower-casing the
-   registry applies. Otherwise the answer is 403 `tenant_forbidden`. The same answer is given for a
-   path tenant that does not exist.
-4. **Opt-in.** A PAT with `restriction.restAccess == false` gets 403 `rest_access_denied`.
-5. The resulting principal is:
-   `RestPrincipal(userId, username, tenant, patId = Some(id), restriction, jwtRoles = ∅, jwtGroups = ∅)`.
-
-**`last_used_at` write amplification.** `PatStore.verify` runs an `UPDATE ... RETURNING` on every
-call (`PatStore.scala:207-221`). The change is to stamp `last_used_at` only when the stored value is
-more than 60 s old, using one conditional `UPDATE`, or a `SELECT` followed by a conditional
-`UPDATE`. This benefits MCP as well. Without it, a valid token can drive a row lock and a WAL write
-per request on the control-plane pool.
-
-**New PAT axis `restAccess: Boolean = false`** on `TokenRestriction`:
-
-- Liquibase `00NN-pat-rest-access.yaml` adds `rest_access BOOLEAN NOT NULL DEFAULT false` to
-  `qodstate_pat`. Existing rows read `false`, which is what makes the axis opt-in.
-- `TokenRestriction.narrow`: a child may be `true` only when its parent is `true`. Any other
-  combination returns `Left("restAccess")`. This is the opposite direction to `branchOnly`, because
-  `restAccess` widens what a token can do.
-- **Root mints.** A PAT minted from a login session has `TokenRestriction.Unrestricted` as its
-  parent (`ondemand/api/PatHandlers.scala:176-183`). Under the rule above such a PAT could never
-  carry `restAccess`.
-  - Add a dedicated constant, `TokenRestriction.SessionRoot = Unrestricted.copy(restAccess = true)`,
-    used **only** as the parent of session-rooted mints.
-  - `Unrestricted` keeps `restAccess = false`, so no other code that builds `Unrestricted` is opted
-    in silently.
-- **Surfaces:**
-  - REST `POST /api/auth/pat/create`: a new `restAccess` field (DTO in `ondemand/api/Dtos.scala`).
-  - The MCP PAT-minting tool (`mcp/McpPlatformTools.scala:445`, next to `branch_only`).
-  - The CLI: `qod auth pat create --rest-access` (`cli/src/qod_cli/commands/auth.py:137,170`, next
-    to `--branch-only`).
-  - The UI PAT form, if it exposes scope axes.
-  - PAT listing shows the flag.
-  - Regenerate `cli/tests/resources/openapi.yaml` with `GenOpenApi`, and keep the CLI parity test
-    green.
-
-### 5.3 JWT path
-
-1. Resolve the path tenant with `sup.getTenant`. An unknown tenant gets 401, with the same body as
-   §5.1.
-2. **Only the tenant's own OIDC provider** (`TenantOidcRegistry.forTenant(tenantId)`,
-   `edge/auth/TenantOidcRegistry.scala:36-66`) validates the token. If the tenant has none, the
+1. **Intake.** Only `Authorization: Bearer <token>` is read. The scheme is case-insensitive and the
+   token is at most 8 KiB.
+   - Everything else gets 401: a missing header, several `Authorization` headers, `Basic`,
+     `X-API-Key`, a cookie, or `?access_token=`.
+   - A token that does not start with `qod_pat_` (`PatStore.TokenPrefix`) gets 401 in slice 1.
+     Slice 2 sends those tokens to OIDC.
+2. **Resolve.** `PatAuthenticator.resolve(token)` (`ondemand/auth/PatAuthenticator.scala:72`)
+   checks the hash, revocation, expiry and that the owner is enabled. If it returns `None`, the
    answer is 401.
-   - `AuthenticationService.bearerChainFor(Tenant)` is **not** reused: it keeps every global
-     provider (the HS256 `jwt` provider and the global OIDC ones) and prepends or swaps in the
-     tenant provider (`edge/auth/AuthenticationService.scala:127-145`).
-   - A global IdP's `alice` is not tenant B's `alice`, and the URL path must not be what binds
-     them (P-9).
-   - `EdgeHandshake` is not used either, because of its trust-the-client branch (S4).
-3. **REST-only hardening**, applied on top of the provider's checks:
-   - An `exp` claim is required. A token without one gets 401, even though the authenticators
-     accept such tokens (S4 decides how `exp` is read).
-   - Signature, algorithm, JWKS, issuer and audience checks are exactly those of
-     `OidcBearerAuthenticator`: Nimbus, with `aud` required to contain the clientId.
-   - Nimbus also enforces `exp`/`nbf` with its default 60 s clock skew. `iat` is not checked, and
-     REST does not add a check for it.
-4. The principal is the validated username together with the provider's `jwtRoles`/`jwtGroups`,
-   with `patId = None` and `restriction = TokenRestriction.Unrestricted`. A JWT has no PAT axes, and
-   the ACL still applies in full.
-5. **Tenant binding** comes from §4 step 7: `authorizeHandshake` looks the user up **inside the
-   path tenant**, with `superuserAdmissible = false`. As with FlightSQL, the IdP user must be
-   provisioned in QoD, through SCIM or `user/create`.
+3. **No superuser.** An owner with `user.tenant == None` gets **401**, with the same body as an
+   invalid token (constraint 3). This is where the edge departs from `McpToolArgs.tenantOf`, which
+   accepts a superuser PAT when the tenant is given explicitly.
+4. **Tenant binding**, mirroring `McpToolArgs.tenantOf` (`mcp/McpToolArgs.scala:45-59`).
+   - The path tenant must equal the owner's tenant. Otherwise the answer is 403 `forbidden`, with
+     the message "your token is scoped to tenant '<own>'".
+   - An unknown path tenant gets that same answer, so a PAT holder cannot probe whether a tenant
+     exists.
+5. **Tools axis.** If `restriction.allowsTool("rest")` is false, the answer is 403 `forbidden`.
+   - This is the same check `McpRoutes` applies to MCP tools. A PAT with no `tools` restriction is
+     admitted.
+   - `rest` becomes a **reserved tool name**. Add it to the list of names that PAT minting and the
+     MCP tools registry know about, so that no MCP tool can ever be called `rest`.
+6. **`branchOnly`.** These tokens are admitted. Every statement is a SELECT classified as READ,
+   which `routedExecutor`'s `writeOnMain` check (`Main.scala:1423-1429`) lets through.
+7. **`ExecCaller`.** It is built exactly as `McpDataTools` builds one for a PAT principal
+   (`mcp/McpDataTools.scala:88-98`):
+   - `connectionId = s"rest-${patId}"`. This stays stable per PAT, because `executeWith` opens a
+     router session per connection id.
+   - `identity` is the owner's username.
+   - `restriction` is the PAT's restriction, and `patId` is set.
+   - `source = "rest"` is new (§8.1).
+
+   The edge **never** uses `ExecCaller.unrestricted`.
+
+### 5.3 Slice 2: OIDC bearer (outline, detailed in PR 2)
+
+Recorded now so that slice 1 does not rule anything out:
+
+- **Validate** through the **path tenant's own** OIDC provider (`TenantOidcRegistry.forTenant`).
+  - Do not use `AuthenticationService.bearerChainFor(Tenant)`: it keeps the global providers
+    (`edge/auth/AuthenticationService.scala:127-145`), and usernames from a global IdP are not
+    scoped to a tenant.
+  - Never use `EdgeHandshake`: it trusts the client when no provider is configured
+    (`edge/EdgeHandshake.scala:89`).
+- **Require `exp`.** The current authenticators accept a token without one.
+- **Provision the user** in the tenant, as for FlightSQL.
+- **Pass the claims through:** thread `jwtRoles` and `jwtGroups` into `routedExecutor`'s
+  `authorizeHandshake` call.
 
 ---
 
 ## 6. Endpoints
 
-Every endpoint is a `GET` under `/api/v1/tenant/{tenant}/database/{tenantDb}`.
+All endpoints are `GET`, under `/api/v1/tenant/{tenant}/database/{tenantDb}`:
+
+| Path | Returns |
+|---|---|
+| `/schemas` | `[{"name": ...}]`: the schemas the caller can read |
+| `/schemas/{schema}/tables` | `[{"name": ..., "type": "table"\|"view"}]`: the objects the caller can read |
+| `/schemas/{schema}/tables/{table}` | `{"name", "type", "columns": [{"name", "type"}]}` |
+| `/schemas/{schema}/tables/{table}/rows` | the rows (§6.3, §6.4) |
+
+Path segments must follow QoD's identifier rule. A segment that breaks it gets 404, because no
+object can have that name.
 
 ### 6.1 Parameter vocabulary
 
 - **Reserved names:** `select`, `order`, `limit`, `offset`, `asOf`, `asOfTag`, `asOfTs`, `pool`,
-  `format` and `branch` (reserved for P-2).
-  - Reserved names are matched **exactly and case-sensitively**, after the HTTP layer has
-    percent-decoded them once. `LIMIT` is therefore a column filter, which fails unless such a
-    column exists.
+  `format` and `branch`.
+  - They are matched exactly and case-sensitively, after the query string has been percent-decoded
+    once. `+` is a literal plus. An invalid `%` sequence gets 400.
   - A reserved parameter given twice gets 400 `invalid_parameter`.
-- Any other parameter name is a column filter.
-  - A column filter may repeat, and the repeats are combined with AND.
-  - Parameter names that appear in error messages or logs are sanitised: printable ASCII only,
-    truncated to 64 characters.
-- Percent-decoding happens exactly once, in the HTTP layer. `+` is a literal plus, not a space.
-  An invalid `%` sequence gets 400. Values are never decoded a second time.
+  - `branch` gets 400 `invalid_parameter` in slice 1 (Q7).
+- **Column filters.** Every other name is a column filter.
+  - Repeating a filter ANDs the conditions.
+  - An unknown column gets 400 `unknown_column`. It is never ignored.
+- **`reserved_column` (Q6).** The edge returns 400 `reserved_column` when both of these hold:
+  - a reserved parameter's value parses as a filter expression (`[not.]<op>.<value>`);
+  - the probed table has a column with that reserved name.
 
-### 6.2 `GET .../schemas` and `GET .../schemas/{schema}/tables`
+  For example, `limit=eq.5` on a table that has a column named `limit`. Such a column cannot be
+  filtered in this phase; the request is neither ignored nor guessed at. The operator
+  documentation gives the workaround: a view that renames the column.
+- **Parameter names in messages and logs** are sanitised: printable ASCII only, truncated to 64
+  characters. Parameter values never appear.
 
-- Both endpoints run a fixed-template `information_schema` SELECT through `RoutedExecutor`. The only
-  values interpolated into it are the catalog alias and the schema name, each passed through
-  `SqlLiterals.duckdbLiteral` (`model/SqlLiterals.scala`).
-- `MetadataFilterRewriter` narrows the rows to what the principal can read (S5).
-- `schemas` returns `[{"name": ...}]`, excluding `information_schema` and `pg_catalog`.
-- `tables` returns `[{"name": ..., "type": "table" | "view"}]`.
-  - A schema with no visible object gets **404**, not `[]`.
-  - `information_schema` and `pg_catalog` as a path schema get 404 on every endpoint.
-- Each listing is capped at `maxRows`. A listing that hits the cap sets `X-QoD-Truncated: true`.
+### 6.2 Discovery (fails closed, constraint 2)
 
-### 6.3 `GET .../schemas/{schema}/tables/{table}` (detail) and the schema probe
+**Listings.** `schemas` and `tables` run a fixed `information_schema` SELECT through the executor.
 
-The **schema probe** is `SELECT * FROM "<catalog>"."<schema>"."<table>" [AT (VERSION => n)] LIMIT 0`.
-It runs through `RoutedExecutor`, and its Arrow schema is the column contract **after policy**:
+- The only interpolated values are the session catalog and the schema, both rendered with
+  `SqlLiterals.duckdbLiteral`.
+- With `acl.filteredMetadata` on, `MetadataFilterRewriter` narrows the rows to the caller's
+  grants (S5).
+- With it off, reading `information_schema` needs an explicit grant (see the `filteredMetadata`
+  comment in `application.conf`). Without that grant the statement is denied, which becomes a 404.
+  Discovery therefore fails closed in both modes.
+- `information_schema` and `pg_catalog` are never valid path schemas (404).
+- A schema with nothing visible in it gets **404**, not `[]`.
+
+**Detail and `/rows`** both use the probe
+`SELECT * FROM "<catalog>"."<schema>"."<table>" [AT (VERSION => n)] LIMIT 0`, run through the
+executor. Its Arrow schema is the column contract **after policy**:
 
 - columns dropped by CLS are absent;
-- masked columns carry their masked type;
-- an ACL denial, `NotFound` and `BadRequest` all collapse to 404 `not_found`, with one body and the
-  same number of executor and store calls on every branch.
+- masked columns look like ordinary columns (Q5).
 
-The detail endpoint returns `{"name", "type", "columns": [{"name", "type"}]}`, where `type` is the
-DuckDB type name mapped from the Arrow field. There is no masked flag (Q5).
+An `acl_denied`, a not-found or a bad-request from the probe all become one 404 `not_found`, with
+the same body, the same headers and the same number of executor calls.
 
-For `/rows`, the probe runs first and its schema is the **only** source of identifiers, both for
-output and for validation. The probe and the data statement carry **the same** `AT (VERSION => id)`,
-and that id is the `X-QoD-Snapshot` value.
+**What the edge interpolates.** Nothing beyond what constraint 1 already allows:
 
-This costs one extra node round trip per `/rows`, which is accepted for v1. A later optimisation
-could cache the probe for a short time, keyed by
-`(tenant, userId, tenantDb, schema, table, snapshot)`.
+- the session catalog, from the registry;
+- schema and table names that passed the identifier rule;
+- column names, taken from the probe;
+- values, through `SqlLiterals`.
 
-### 6.4 `GET .../rows`: grammar and SQL rendering
+### 6.3 `/rows`: grammar and rendering
 
-**Grammar** (applied to values already percent-decoded once):
+**Grammar.** Values are percent-decoded once.
 
 ```
-select   := col ("," col)*                     -- default: all probed columns, probe order
+select   := col ("," col)*                     -- default: every probed column, probe order
 order    := term ("," term)*
 term     := col ["." ("asc"|"desc")] ["." ("nullsfirst"|"nullslast")]
 filter   := <col> "=" ["not."] op "." value
 op       := eq | neq | gt | gte | lt | lte | like | ilike | in | is
-value    := raw text (eq..lte, like, ilike) | "(" item ("," item)* ")" (in) | null|true|false (is)
-item     := bare | '"' quoted '"'              -- quoted: \" and \\ escapes, allows ',' and ')'
-limit    := [1-9][0-9]{0,9} and <= 2^31-1     offset := "0" | [1-9][0-9]{0,9} and <= 2^31-1
+value    := raw text | "(" item ("," item)* ")" (in) | null|true|false (is)
+item     := bare | '"' quoted '"'              -- quoted: \" and \\ escapes
+limit    := [1-9][0-9]{0,9} (<= 2^31-1)       offset := "0" | [1-9][0-9]{0,9} (<= 2^31-1)
 ```
 
-**Validation.** Validation fails closed: every failure gets 400, and the message names the parameter
-but never its value.
+**Validation.** Every failure gets 400. The message names the parameter, never its value.
 
-- **Column matching** uses ASCII lower-casing only (`toLowerCase(Locale.ROOT)` on ASCII input)
-  against the probed schema. It is not Unicode `equalsIgnoreCase`, which folds characters such as
-  U+212A that DuckDB does not.
-  - The identifier rendered into the SQL is always the probed spelling.
+- **Columns** are matched against the probe with ASCII-only lower-casing, not Unicode
+  `equalsIgnoreCase`. The SQL always uses the probe's spelling.
   - An unknown or ambiguous column gets `unknown_column`.
-- **Typing** is checked against the probed Arrow type:
-  - **Integers:** the value is parsed as a plain decimal integer, range-checked against the column
-    type, and rendered from the validated text.
-  - **Decimal and floating-point:** the grammar is `-?digits[.digits]` with **no exponent**, and the
-    precision and scale must fit. This stops `1e999999999`, which `BigDecimal` would accept and
-    `toPlainString` would expand to about 1 GB.
-  - **Booleans:** `true` or `false` only.
-  - **Dates and timestamps:** ISO-8601, parsed with `java.time`.
-  - **Strings:** passed through as-is.
-  - **NUL:** a NUL byte anywhere gets 400.
-- **Operator applicability:**
-  - `like` and `ilike` apply only to string columns.
-  - Struct, list, map, union, blob and interval columns are **not filterable or orderable** in v1
-    (`invalid_filter`), but they can be selected.
-- **`like` and `ilike` patterns:**
+  - A duplicate in `select` gets `invalid_parameter`.
+- **Values** are type-checked against the probed type:
+  - integers are range-checked;
+  - decimals must match `-?digits[.digits]`, with **no exponent**, and fit the precision and scale.
+    The exponent ban blocks `1e999999999`, whose plain-string rendering is enormous;
+  - booleans are `true` or `false`;
+  - dates and timestamps are ISO-8601;
+  - strings are passed through as-is;
+  - a NUL byte anywhere gets 400.
+- **Operators and column types:**
+  - `like` and `ilike` apply to string columns only.
+  - Nested, blob and interval columns can be selected, but not filtered or ordered.
+- **LIKE patterns:**
   - `*` maps to `%`.
-  - A literal `%`, `_` or `\` is escaped, and `ESCAPE '\'` is rendered **only when something was
-    escaped**.
-  - At most 4 wildcards are allowed per pattern. This value is provisional until S8 has been
-    measured.
-- **Other rules:**
+  - A literal `%`, `_` or `\` is escaped, and `ESCAPE '\'` is emitted only when something was
+    escaped.
+  - At most 4 wildcards per pattern (subject to S8).
+- **Paging and snapshots:**
   - `offset > 0` without `order` gets `order_required`.
-  - More than one of `asOf`, `asOfTag` and `asOfTs` gets `invalid_selector`.
-  - A duplicate column in `select` gets `invalid_parameter`.
-- **Hard caps.** Each gets 400 `invalid_parameter`. These are constants, not configuration: they
-  bound parser work and SQL size, they do not shape results.
-  - at most 32 filters;
-  - at most 64 `in` items;
-  - at most 16 order terms;
-  - at most 256 selected columns;
-  - at most 4 KiB per value.
+  - More than one of the `asOf*` parameters gets `invalid_selector`.
+- **Hard caps** (constants): 32 filters, 64 `in` items, 16 order terms, 256 selected columns, and
+  4 KiB per value.
 
-**Rendering** (`RowsSql.render`, a pure function):
+**Rendering.** `RestSql.render` is pure, and produces one statement that is handed to the executor:
 
 ```
-SELECT <probed idents> FROM "<catalog>"."<schema>"."<table>" AT (VERSION => <id>)
- WHERE <p1> AND <p2> ...
- ORDER BY <terms>
- LIMIT <effectiveLimit + 1> OFFSET <offset>
+SELECT <probed idents> FROM "<catalog>"."<schema>"."<table>" [AT (VERSION => <id>)]
+ WHERE <p1> AND ...  ORDER BY <terms>  LIMIT <effectiveLimit + 1> OFFSET <offset>
 ```
 
-- **Invariant.** No byte of user input reaches the SQL text except inside a string literal produced
-  by `SqlLiterals.duckdbLiteral`.
-  - Identifiers come only from the probe and pass through `SqlLiterals.duckdbIdent`.
-  - Values are rendered as `CAST(<duckdbLiteral> AS <probed type>)`. Numbers, booleans and dates
-    are therefore rendered as quoted literals too.
-- **Catalog confinement.** Every name is **fully qualified** with the tenant-db's session catalog,
-  `<catalog>`. How that name is resolved depends on the kind (§6.7).
-  - The router's `wrapWithDefaultSchema` (`edge/FlightSqlRouter.scala:864-895`) prefixes `USE`
-    with the tenant-db's *default* schema, not the path schema.
-  - `USE` sets a default. It does **not** stop name resolution from leaving the catalog, so the
-    three-part form is what confines the statement (S7).
-  - The two-part form used by the admin preview (`ondemand/api/CatalogPreviewHandlers.scala:139`)
-    is not copied.
-- **Operator rendering:**
-  - `is.null`, `is.true` and `is.false` render as `IS [NOT] NULL|TRUE|FALSE`.
-  - `neq` renders as `<>`.
-  - `not.` wraps the predicate in `NOT (...)`.
-- **S3 outcome.** If S3 shows that `WHERE` sees raw values, the rendered shape becomes
-  `SELECT ... FROM (SELECT * FROM "<catalog>"."<schema>"."<table>" AT (...)) AS q WHERE ... ORDER BY ... LIMIT ...`.
-  S3 decides this once for all requests; it is never chosen per request.
-- **Limit.** `effectiveLimit = min(limit ?: defaultLimit, maxRows, pat.maxRows)`, computed by
-  `ExecCaller.effectiveMaxRows` (`ondemand/api/ExecCaller.scala:25`). The query fetches
-  `effectiveLimit + 1` rows so the edge can tell whether more exist.
+- **Identifiers** go through `SqlLiterals.duckdbIdent`.
+- **Values** go through `CAST(<SqlLiterals.duckdbLiteral> AS <probed type>)`. No byte of user input
+  reaches the SQL text outside such a literal.
+- **Names are fully qualified** with the session catalog (§6.6). `USE` only sets a default; it does
+  not confine name resolution (S7).
+- **No positional references, ever.** `ORDER BY` uses column names, and the data statement lists
+  its columns explicitly. Positional references are the class of statement behind #114. The
+  rewriter handles them since 0.9.6, and the edge never produces them in the first place.
+- **Operator mapping:** `is.*` becomes `IS [NOT] NULL|TRUE|FALSE`, `neq` becomes `<>`, and `not.`
+  becomes `NOT (...)`.
+- **Limit:** `effectiveLimit = min(limit ?: defaultLimit, maxRows, PAT maxRows)`, computed by
+  `ExecCaller.effectiveMaxRows` (`ondemand/api/ExecCaller.scala:25`). The statement fetches one
+  extra row so the edge can detect truncation.
+- **Snapshot (DuckLake):** the probe and the data statement carry the **same** `AT` id, and that
+  id is the `X-QoD-Snapshot` value.
 
-**Snapshot.** On DuckLake, the data statement **always** carries `AT (VERSION => id)`.
+### 6.4 Response formats and headers (slice 1)
 
-- `id` is the resolved selector when one was given. Otherwise it is
-  `DuckLakeCatalogReader.maxSnapshotId()`.
-- The response always carries `X-QoD-Snapshot: <id>`. Passing that value back as `asOf` yields
-  consistent pages.
-- Views follow the outcome of S2.
+The format is taken from the `format` parameter first, then from `Accept`, and falls back to JSON.
+Anything else gets 406 `unsupported_format`. Slice 2 adds `arrow` and `parquet`, streamed.
 
-### 6.5 Response formats and headers
+**`json`** (`application/json`):
 
-(Section 6.7 gives the rules that differ per database kind.)
-
-The format is chosen from the `format` query parameter first, then from `Accept`, and falls back to
-JSON. An unsupported value gets 406 `unsupported_format`. `parquet` gets 406 until P-1 is resolved.
-Negotiation lives in its own small pure object; it is not part of `RowsQuery`.
-
-| format | Content-Type |
-|---|---|
-| `json` | `application/json` |
-| `csv` | `text/csv; charset=utf-8` |
-| `arrow` | `application/vnd.apache.arrow.stream` |
-
-**`json`:**
-
-- The body is an array of objects, with keys in select order.
-- Integers up to 64 bits are JSON numbers. HUGEINT and UHUGEINT are strings.
-- DECIMAL is an exact JSON number built from `BigDecimal`, never from a double.
-- FLOAT and DOUBLE NaN and ±Inf are strings.
-- Dates and timestamps are ISO-8601, with `Z` when the type carries a time zone.
+- An array of objects, with keys in select order.
+- Integers up to 64 bits are JSON numbers. HUGEINT is a string.
+- DECIMAL is an exact number, built from `BigDecimal` and never through a double.
+- NaN and ±Inf are strings.
+- Dates and timestamps are ISO-8601, with `Z` when a zone is present.
 - BLOB is base64.
-- Struct, list and map become nested JSON.
-- The encoder is **not** `ArrowRowsDecoder`, whose `toString` fallback is lossy
-  (`ondemand/api/ArrowRowsDecoder.scala`).
+- Nested types become nested JSON. The encoder does **not** reuse `ArrowRowsDecoder`, whose
+  `toString` fallback loses information on nested types.
 
-**`csv`:**
+**`csv`** (`text/csv; charset=utf-8`):
 
-- RFC 4180: a header row, CRLF line endings, fields quoted when needed.
-- Nested values are written as their JSON text.
-- Values are **not** rewritten to defuse spreadsheet formulas. Data integrity comes first, and the
-  risk is documented for consumers.
+- RFC 4180, with a header row and CRLF line endings.
+- Nested values are written as JSON text.
+- Values are not rewritten to defuse spreadsheet formulas. The operator documentation notes this.
 
-**`arrow`:** the node's batches, re-framed with `ArrowStreamWriter`. The row cap is enforced by
-slicing the last batch.
-
-**Headers on a successful `/rows` response:**
+**Headers on `/rows`:**
 
 - `X-QoD-Snapshot`, on DuckLake only.
-- `Content-Range: <offset>-<offset+n-1>/*`, or `*/*` when `n = 0`.
-- `X-QoD-Truncated: true`, only when a **server or token cap** cut the page below what the client
-  asked for **and** more rows exist. A page cut by the client's own `limit` is ordinary pagination.
+- `Content-Range: <offset>-<offset+n-1>/*`, or `*/*` when no row is returned.
+- `X-QoD-Truncated: true`, only when a server or token cap cut the page below what the client asked
+  for and more rows exist.
 
-Header values are built only from integers and fixed strings, so no response splitting is possible.
+**Caching** is what this edge is for (§1.1), and it must never leak across principals:
 
-**Streaming and cleanup:**
+- Every response carries `Cache-Control: private` and `Vary: Authorization`. A shared cache or CDN
+  must never serve one principal's rows, which may be RLS-filtered, to another.
+- A DuckLake request pinned by `asOf` or `asOfTag` has immutable content, so it gets
+  `max-age=300`. The value is short so that a revoked grant stops being served quickly.
+- Everything else gets `no-cache`.
+- ETag is out of scope.
 
-- The body is an fs2 stream over the `ArrowReader`, read in `IO.blocking`.
-- **One** finalizer runs exactly once, on completion, on error or on client disconnect. It calls
-  `Routed.close()`, which also deregisters the statement from `ActiveStatementRegistry`, and then
-  releases the per-user slot. Both operations are idempotent.
-- A failure **after the first byte** cannot change the status. The edge then aborts the connection,
-  either through a reset or an incomplete chunked encoding. It never ends a JSON array or CSV
-  cleanly after such a failure.
-- The full result is never buffered.
+Header values are built only from integers and fixed strings.
 
-### 6.6 `GET /api/v1/openapi.json`
+**Encoding** reads the `ArrowReader` in `IO.blocking`. **One** idempotent finalizer calls
+`Routed.close()`, which also deregisters the statement from `ActiveStatementRegistry`. It runs on
+success, on error and on client disconnect.
 
-- Generated by Tapir's `OpenAPIDocsInterpreter` over `RestEdgeEndpoints`.
-- Unauthenticated: the document is static and contains no tenant data.
-- The dynamic column filters are described as a free-form query-parameter map, and the grammar is
-  given in the description.
-- The document is a **contract**. It is pinned by a golden-file test (H15), so any change to it has
-  to be deliberate.
+- In slice 1 the body is bounded by the row cap and may be buffered.
+- Slice 2's streaming formats must abort the connection on an error after the first byte, and must
+  never finish a body that looks valid.
+
+### 6.5 Truncation of listings
+
+Listings are capped at `maxRows`. When the cap is hit, the response sets `X-QoD-Truncated: true`.
+
+### 6.6 Database kinds
+
+Every kind QoD registers (`model/TenantDbKind.scala`) is served. The table lists the only
+differences between them:
+
+| | `ducklake` | `duckdb-file` (including encrypted) | `memory` |
+|---|---|---|---|
+| Session catalog `<catalog>` | `TenantDb.catalogAlias(metastore)` | same | **`memory`**. `catalogAlias` returns `""` here (`model/TenantDb.scala:80-85`). |
+| `AT` clause and `X-QoD-Snapshot` | always | never | never |
+| `asOf*` | served | 400 `invalid_kind` (the preview rule) | 400 `invalid_kind` |
+| Consistency across pages | guaranteed by sending `asOf` back | best-effort | best-effort. Each node holds its own in-memory data, as on every door. |
+| Encryption at rest | transparent | transparent | n/a |
+
+Two rules follow from the table:
+
+- **One resolver for the session catalog.** The session catalog comes from the router's per-kind
+  logic (`perKindDb`/`perKindSchema`, `edge/FlightSqlRouter.scala:419-428`).
+  - That logic is extracted into one pure helper in `model/`, which both the router and the edge
+    call. This refactors existing code; it does not add a new quoting helper.
+  - The edge never calls `TenantDb.catalogAlias` directly. If the router and the edge disagreed,
+    the ACL would validate one catalog while the node read another.
+- **The probe and the data statement run on the same node.** Without a snapshot pin, the data
+  statement is sent to the probe's node (`Routed.nodeId`), through the router's existing
+  `preferredNode`, threaded through `ExecCaller` (§8.1).
+  - If that node is gone, the router falls back as usual.
+  - If the schema changed in between, the result is a 502, never SQL that skipped validation.
 
 ---
 
-### 6.7 Database kinds
+## 7. Transport hardening and residual risk
 
-v1 serves **every tenant-db kind QoD registers** (`model/TenantDbKind.scala`): `ducklake`,
-`duckdb-file` and `memory`. All three kinds share the endpoints, grammar, formats, authentication,
-policies and limits. The table below lists the only points where they differ, each checked against
-the code:
+These are HTTP-layer defaults, not data policy.
 
-| Aspect | `ducklake` | `duckdb-file` (incl. encrypted) | `memory` |
-|---|---|---|---|
-| Session catalog `<catalog>` | `TenantDb.catalogAlias(metastore)`: `catalogAlias`, else `dbName` | the same | **`memory`**. `catalogAlias` returns `""` here because the metastore is empty (`model/TenantDb.scala:80-85`), so calling it directly would render `""."s"."t"`. |
-| Default schema | `schemaName` | `schemaName` | `main` |
-| Snapshot / `AT (VERSION => n)` | always rendered; `X-QoD-Snapshot` sent | never; no header | never; no header |
-| `asOf`, `asOfTag`, `asOfTs` | served (`SnapshotSelector`) | 400 `time_travel_unsupported` | 400 `time_travel_unsupported` |
-| Consistency across pages | **guaranteed** by echoing the snapshot back as `asOf` | best-effort: rows committed between pages can shift them | best-effort. With several nodes, **each node holds its own in-memory data**, so which node the router picks decides what a page sees. This is the same on every door today. |
-| Encryption at rest | transparent (per-file keys in the DuckLake catalog) | transparent (the node attaches with `encryptionKey`) | n/a |
-| Branch tenant-dbs | 404 in v1 (P-2) | n/a | n/a |
+### 7.1 Slice 1 transport
 
-Rules that follow from this table:
-
-- **One resolver for the session catalog.** The router already maps a kind to its session catalog
-  and default schema inline (`perKindDb`/`perKindSchema`, `edge/FlightSqlRouter.scala:419-428`).
-  Extract that logic into one pure helper, for example `SessionCatalog.of(kindWire, metastore)` in
-  `model/`, and have both the router and the REST edge call it. The REST edge must **never** call
-  `TenantDb.catalogAlias` directly. If the two ever disagreed, the ACL would validate against one
-  catalog while the node executed against another.
-- **Confinement per kind.** The only catalog a REST statement may name is `<catalog>`. For `memory`
-  that is the built-in `memory` catalog itself, so S7 must prove that naming it does not open any
-  other built-in catalog.
-- **The probe and its data statement run on one node.** On DuckLake, the shared `AT` id makes them
-  consistent on any node. The other kinds have no such pin, and a `memory` pool's nodes can even
-  hold different tables. So the data statement is sent to the probe's node (`Routed.nodeId`),
-  through the router's existing `preferredNode` (`FlightSqlRouter.execute`), threaded through
-  `ExecCaller` (§8.1). If that node is no longer routable, the router falls back as usual, and a
-  schema that has since changed shows up as a 502 `upstream_error`, never as unvalidated SQL.
-- **Listing is kind-agnostic.** `MetadataFilterRewriter` keys its filter on the session catalog it
-  is given (`defaultDatabase`, `edge/meta/MetadataFilterRewriter.scala:225`), which the router
-  derives per kind. The `information_schema` templates in §6.2 filter on the same `<catalog>` value.
-  S5 covers all three kinds.
-- **Time-travel errors are uniform.** For a non-DuckLake tenant-db, `asOf*` returns
-  `time_travel_unsupported` only after authorization (§4 step 7). The kind is therefore never
-  revealed to a caller who cannot read the database.
-
-## 7. Hardening for internet exposure
-
-### 7.1 Transport and HTTP layer
-
-- **TLS is on by default.**
-  - It uses the same PEM paths as the other doors, plus `CertGen.ensureCertFiles` and `PemKeyStore`,
-    as `QuackFrontDoorServer` does (`edge/quack/QuackFrontDoorServer.scala:69-77`).
-  - `tlsEnabled=false` with a non-loopback `host` produces a boot WARN: the door then expects a
-    TLS-terminating proxy in front of it. That proxy must also cap request rate and must not use
-    h2c upgrades toward the edge.
-- **Ember limits** (S6). All of them are configurable with safe defaults:
-  - header size: 16 KiB, which also bounds the URI;
-  - request-header receive timeout: 10 s (slowloris);
-  - idle timeout: 60 s;
-  - maximum connections: 512;
-  - shutdown timeout: 1 s.
-- **Security headers** go on every response, including 4xx and 5xx responses produced by Ember and
-  Tapir:
-  - `X-Content-Type-Options: nosniff`
-  - `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`
-  - `Referrer-Policy: no-referrer`
-  - `Cache-Control: no-store`
-  - `Strict-Transport-Security: max-age=31536000` when TLS is on
+- **TLS** is on by default. It reuses `CertGen.ensureCertFiles` and `PemKeyStore`, like
+  `QuackFrontDoorServer`. With TLS off on a non-loopback host, boot logs a WARN.
+- **Ember limits** (S6):
+  - 16 KiB of headers, which also bounds the URI;
+  - a 10 s timeout for receiving request headers;
+  - a 60 s idle timeout;
+  - 512 connections.
+- **Security headers** go on every response, including errors generated by Ember or Tapir:
+  - `X-Content-Type-Options: nosniff`;
+  - `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`;
+  - `Referrer-Policy: no-referrer`;
+  - HSTS when TLS is on;
   - no `Server` version header.
+- **Error hygiene.** Node, JDBC and parser messages are logged at WARN with the request id, and
+  are never sent to the client.
+- **Log hygiene.**
+  - The `Authorization` header is never logged.
+  - Access logs record the route template and the sanitised parameter **names**, never their
+    values, because filter values are often personal data.
 
-  The middleware wraps the whole `HttpApp`, not individual routes, so that framework-generated
-  responses get the headers too.
-- **CORS is off by default** (`corsAllowedOrigins = ""`).
-  - The setting takes exact origins (`scheme://host[:port]`) or `*`. A malformed origin fails
-    config load.
-  - When an origin matches, the edge echoes it back with `Vary: Origin`.
-  - `Access-Control-Allow-Credentials` is **never** sent. The edge uses bearer tokens and no
-    cookies, so there is no CSRF surface.
-  - Allowed method: `GET`.
-  - Allowed headers: `Authorization`, `Accept`.
-  - Exposed headers: `X-QoD-Snapshot`, `X-QoD-Truncated`, `Content-Range`, `X-Request-Id`,
-    `Retry-After`.
-- **Error hygiene.**
-  - Exception text from the node, JDBC or the parser never reaches the client. It is logged at
-    WARN with the request id.
-  - Client messages are fixed strings for each error code. The only exception is 400 messages,
-    which name the sanitised parameter (§6.1).
-- **Logging.**
-  - `Authorization` is never logged.
-  - Access logs record the method, the route template, the sanitised parameter **names** and the
-    status. Parameter values are never logged, because filter values are often personal data
-    (`email=eq.x`).
-  - Statement history keeps the rendered SQL. This is the existing behaviour for every door, and
-    only admins can see history.
+### 7.2 Timeout without leaks
 
-### 7.2 Configuration that fails closed (refused at load)
+- The edge applies `timeoutTo(min(stmtTimeoutSec, PAT stmtTimeoutMs))` over the executor.
+  `routedExecutor` already enforces the PAT's own bound.
+- A `Routed` that arrives **late** must be closed, not dropped. The edge runs the executor as a
+  fiber whose `guaranteeCase` finalizer closes any late result.
+- The same fix belongs in `routedExecutor`'s own `timeoutTo` branch (`Main.scala:1509-1520`), which
+  currently drops the late result.
+- The node keeps running either way (O-4).
 
-`RestEdgeConfig.validate(acl, …): Either[String, Unit]` follows the pattern of
-`HaPreconditions.validate` (`ondemand/ha/HaPreconditions.scala:12-39`), and Main applies it with
-`.left.foreach(sys.error)`. Each refusal message names the environment variable and the fix. The
-cases are:
+### 7.3 Proposed for slice 2 (O-1): minimal abuse controls
 
-- `enabled && !acl.enabled`. Message: *"quack-rest requires ACL: set QOD_ACL_ENABLED=true or
-  QOD_REST_ENABLED=false"*.
-- `enabled && !acl.filteredMetadata`. Without it, listings would leak the names of objects the
-  caller cannot read. The message names `QOD_ACL_FILTERED_METADATA`.
-- `defaultLimit < 1`, `maxRows < defaultLimit`, `stmtTimeoutSec < 1`, or a non-positive
-  concurrency value or limit.
-- A `trustedProxies` CIDR or a CORS origin that cannot be parsed.
-- A `port` equal to another enabled door's port.
+These are not in the maintainer's slices; they are offered for agreement.
 
-### 7.3 Failed-auth throttle (`AuthThrottle`, `ClientAddress`)
+- **Per-IP throttle on failed authentication:**
+  - The client IP is the TCP peer. `X-Forwarded-For` is honoured only when the peer is in
+    `trustedProxies`, and is read from the right.
+  - IPv4-mapped addresses are normalised. IPv6 addresses are keyed per /64.
+  - After N 401s within the window, the IP gets 429 before any credential lookup.
+  - A global budget catches distributed attempts. Entries that are currently blocking are never
+    evicted.
+- **Per-user in-flight cap**, keyed by `(tenant, userId)` so that minting more PATs does not buy
+  more slots. A slot is released only when the node call has actually finished.
 
-- **Client IP.**
-  - By default the client IP is the TCP peer.
-  - When the peer falls inside `trustedProxies`, the edge walks `X-Forwarded-For` **from the
-    right** and takes the first hop that is not a trusted proxy. A malformed header falls back to
-    the peer, so a client outside the trusted set cannot spoof an address.
-  - IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are normalised to IPv4.
-  - Native IPv6 addresses are keyed by their /64.
-- **What counts as a failure.** Every 401, plus the authentication-type 403s
-  (`tenant_forbidden`, `rest_access_denied`), counts as one failure per IP in a sliding window.
-  403s from authorization (§4 step 7) and 404s do **not** count, by design: they come from an
-  already-authenticated principal, who is bounded by §7.4.
-- **Budget.**
-  - Once an IP exceeds `authFailuresPerWindow` (default 20 per 60 s), every request from it gets
-    429 `too_many_auth_failures` with `Retry-After`, for `authBlockSec` (default 300).
-  - The block applies **before** any credential check, which also caps load on the PAT and JWKS
-    lookups.
-  - A success does not reset the counter.
-- **Global backstop.** A token bucket over *all* credential verifications that end in failure
-  (`authFailuresGlobalPerSec`, default 50). Once it is empty, a request whose credential fails gets
-  429 instead of 401. This stops an attacker who controls many addresses, such as an IPv6 /48 or a
-  botnet, from turning the per-IP table into unlimited attempts.
-- **Memory bound.**
-  - Counters live in a Caffeine cache capped at `authThrottleMaxEntries` (default 100 000), using
-    `Caffeine`, which is already a dependency (`project/Dependencies.scala:103-104`).
-  - **Blocked** entries live in a separate map, bounded by the same cap, that is never evicted
-    early. When that map is full, the oldest block that has expired is dropped first. If none has
-    expired, the new offender is still refused through the global bucket.
-  - Evicting a counter can therefore only forget partial progress, never an active block.
-- **Known collateral.** Clients behind the same NAT, CGNAT or /64 share a budget. The operator
-  documentation recommends a WAF and `trustedProxies` for that case.
-- **Audit.** Failures are audited with `origin = "rest"` through the existing `AuditRateLimiter`
-  (`ondemand/telemetry/AuditRecorder.scala:115`). The password lockout does not apply, because
-  bearer failures are not password failures.
+Until then, the operator documentation requires a reverse proxy or WAF for internet exposure (O-1).
 
-### 7.4 Per-user concurrency (`UserLimiter`) and timeouts
+### 7.4 Hibernated pools
 
-- **Slots.**
-  - The key is **(tenant, userId) on both the PAT and the JWT path**. It is never the PAT id,
-    because minting more PATs must not buy more slots.
-  - Each user gets at most `maxConcurrentPerUser` (default 4) in-flight statements, and the edge as
-    a whole at most `maxConcurrentTotal` (default 64).
-  - Past either limit, the edge answers 429 `too_many_requests` with `Retry-After: 1`.
-  - A probe and the data statement that follows it share one slot.
-- **Timeout without leaks.**
-  - The execute is started as a fiber (`.start`). The handler races that fiber against
-    `min(stmtTimeoutSec, pat.stmtTimeoutMs)` and answers 504 `statement_timeout` if the timer wins.
-  - The fiber keeps its own `guaranteeCase` finalizer, which closes any `Routed` that arrives late
-    and **only then** releases the slot. A client that got a 504 therefore keeps its slot until the
-    node has really finished (P-4), so timeouts cannot be used to fan work out.
-  - The same finalizer is what closes a late result that would otherwise leak today through
-    `routedExecutor`'s `timeoutTo` (`Main.scala:1507-1520`), where a late `Routed` is simply
-    discarded. §8.1 fixes this in `RoutedExecutor` for every caller.
-  - The streaming phase is bounded by the same deadline. When it expires mid-body, the connection
-    is aborted (§6.5).
-- **Router session.** The connection id passed to the router is `rest-<tenant>-<userId>`. It is
-  deliberately stable, because `executeWith` opens a session per connection id
-  (`edge/FlightSqlRouter.scala:406-411`). A fresh id per request would grow `SessionRegistry`
-  without bound.
+The router's `resolveSnapshot` resumes a suspended pool and holds the request for up to
+`resumeHoldTimeoutSec` (`edge/FlightSqlRouter.scala:904`). The resulting
+`Unavailable("pool is resuming…")` becomes 503 `pool_resuming` with `Retry-After: 5`.
 
-### 7.5 Hibernated pools
-
-- The router's `resolveSnapshot` resumes a suspended pool and holds the request for up to
-  `resumeHoldTimeoutSec` (`edge/FlightSqlRouter.scala:904`).
-- `Unavailable("pool is resuming…")` maps to 503 `pool_resuming` with `Retry-After: 5`. Any other
-  `Unavailable` maps to 503 `pool_unavailable`.
-- Because of the invariant in §4, only an authenticated and **authorized** caller can wake a pool.
+Only a request that has passed PAT authentication and tenant binding ever reaches the router, and
+pool authorization runs inside `routedExecutor` before `execute`. An anonymous caller therefore
+never wakes a pool.
 
 ---
 
 ## 8. Changes outside `edge/rest`
 
-### 8.1 `RoutedExecutor` extraction and hardening (P1, a prerequisite)
+### 8.1 `ExecCaller`, `routedExecutor` and `FlightSqlRouter.execute`
 
-**Why.** `routedExecutor` is a local `def` inside `Main.scala` (`:1384-1522`), so nothing can test
-it. It is also the chokepoint that every non-FlightSQL caller shares. The changes:
+The changes are minimal. Every new field has a default, so no existing call site changes.
 
-1. **Extract** it into `ondemand/api/RoutedExecutor.scala`, with the same `PreviewExecutor`
-   signature. `Main` constructs it, and the existing call sites (preview, undrop, restore, MCP)
-   stay unchanged.
-2. **Make privileged callers explicit.** The synthetic superuser `EffectiveSet` used by the
-   in-process call sites (preview, undrop, restore dry-run, branch counts and the MCP static key) is
-   selected through a typed `ExecCaller.systemCaller: Boolean` flag, set only at those call sites.
-   The new internet-facing caller can then never reach that branch, whatever identity it carries.
-   Defence in depth: the internal identity those call sites use
-   (`CatalogPreviewHandlers.SuperuserIdentity`) also becomes a reserved username.
-3. **Thread fields through `ExecCaller`** (all defaulted, so existing call sites do not change):
-   - `source: String = "flightsql"`, forwarded to `FlightSqlRouter.execute`. `execute` gains the
-     same parameter and forwards it to `executeWith`, which today hard-codes `"flightsql"`
-     (`edge/FlightSqlRouter.scala:356-368`). MCP call sites pass `"mcp"`.
-   - `preferredNode: Option[String] = None`, forwarded to `FlightSqlRouter.execute`'s existing
-     `preferredNode`. It pins the data statement to the probe's node (§6.7).
-   - `preAuthorized: Option[EffectiveSet] = None`. The REST edge authorizes in §4 step 7 and hands
-     the result over, so the executor skips its own `authorizeHandshake`. Attenuation by the
-     restriction and the `pools`-axis check **still run** on it.
-   - `superuserAdmissible: Boolean = true` for the executor's own `authorizeHandshake` call, which
-     today uses the 3-argument form. REST never reaches that call (it passes `preAuthorized`), but
-     it sets the flag to `false` anyway, as defence in depth.
-4. **Close late results.** In the token-timeout branch, a `Routed` that arrives after the deadline
-   is closed by the fiber's finalizer (§7.4) instead of being dropped.
-5. **Record the source.**
-   - `StatementRecord` gains `source: Option[String]`.
-   - Liquibase `00NN-stmt-history-source.yaml` adds a nullable `source` column to
-     `qodstate_stmt_history`. Existing rows stay `NULL`.
-   - The history REST DTO and the admin UI list show it.
-   - `StatementInstruments` adds a `source` tag to `statements_total` and
-     `statement_duration_seconds`.
+- `ExecCaller` gains `source: String = "flightsql"` and `preferredNode: Option[String] = None`.
+- `routedExecutor` forwards both to `fsRouter.execute`.
+- `FlightSqlRouter.execute` gains `source: String = "flightsql"` and forwards it to `executeWith`.
+  Today `execute` hard-codes the value (`edge/FlightSqlRouter.scala:363`).
+- MCP can then pass `source = "mcp"`. That is optional, and a one-line change.
 
-### 8.2 Config block
+### 8.2 Config (`quack-rest`, modelled on `quack-native`)
 
 ```hocon
 quack-rest {
@@ -777,25 +643,6 @@ quack-rest {
   maxRows = ${?QOD_REST_MAX_ROWS}
   stmtTimeoutSec = 60
   stmtTimeoutSec = ${?QOD_REST_STMT_TIMEOUT_SEC}
-  corsAllowedOrigins = ""
-  corsAllowedOrigins = ${?QOD_REST_CORS_ALLOWED_ORIGINS}
-  # hardening (section 7)
-  trustedProxies = ""                       # comma-separated CIDRs
-  trustedProxies = ${?QOD_REST_TRUSTED_PROXIES}
-  authFailuresPerWindow = 20
-  authFailuresPerWindow = ${?QOD_REST_AUTH_FAILURES_PER_WINDOW}
-  authWindowSec = 60
-  authWindowSec = ${?QOD_REST_AUTH_WINDOW_SEC}
-  authBlockSec = 300
-  authBlockSec = ${?QOD_REST_AUTH_BLOCK_SEC}
-  authFailuresGlobalPerSec = 50
-  authFailuresGlobalPerSec = ${?QOD_REST_AUTH_FAILURES_GLOBAL_PER_SEC}
-  authThrottleMaxEntries = 100000
-  authThrottleMaxEntries = ${?QOD_REST_AUTH_THROTTLE_MAX_ENTRIES}
-  maxConcurrentPerUser = 4
-  maxConcurrentPerUser = ${?QOD_REST_MAX_CONCURRENT_PER_USER}
-  maxConcurrentTotal = 64
-  maxConcurrentTotal = ${?QOD_REST_MAX_CONCURRENT_TOTAL}
   maxConnections = 512
   maxConnections = ${?QOD_REST_MAX_CONNECTIONS}
   maxHeaderBytes = 16384
@@ -804,273 +651,392 @@ quack-rest {
   headerReceiveTimeoutSec = ${?QOD_REST_HEADER_RECEIVE_TIMEOUT_SEC}
   idleTimeoutSec = 60
   idleTimeoutSec = ${?QOD_REST_IDLE_TIMEOUT_SEC}
+  # slice 2: corsAllowedOrigins (QOD_REST_CORS_ALLOWED_ORIGINS)
 }
 ```
 
-- `RestEdgeConfig` lives in `Config.scala`, with `@field @ConfigField(envVar = …, description = …)`
-  on each field, like `QuackNativeConfig` (`Config.scala:937-979`).
-- Main needs a `ProductHint` and a `deriveReader` for it (`Main.scala:104,134`).
-- `ConfigRegistry.rootsFor` needs an entry (`ondemand/api/ConfigRegistry.scala:39,47`) so the admin
-  Config page shows the block.
+- **Config class.** `RestEdgeConfig` lives in `Config.scala`, with
+  `@field @ConfigField(envVar, description)` on every field, like `QuackNativeConfig`.
+- **Main.** Add a `ProductHint` and a `deriveReader`.
+- **`ConfigRegistry.rootsFor`.** Add an entry. That is what makes the block appear in the generated
+  configuration reference (O-2).
+- **Boot validation** covers only the numbers (`defaultLimit >= 1`, `maxRows >= defaultLimit`, and
+  so on) and a port that clashes with another door. It follows the `Either[String, Unit]` pattern
+  of `HaPreconditions.validate`.
 
-### 8.3 Boot, shutdown, deployment
+### 8.3 Boot, banner, shutdown, Helm
 
-- **Main:** `Option.when(cfg.enabled)(new RestEdgeServer(...))`, chained into `dataPlaneIO` after
-  the Quack door, with `adaptError("REST edge init failed")`. A bind failure aborts boot.
-- **Banner:** a REST line in `Banner.startup`.
-- **ShutdownCoordinator:** a new `restEdge: Option[RestEdgeServer]`, stopped in both the JVM hook
-  and `gracefulShutdown`, before the drain.
-- **Deployment:**
-  - `Dockerfile`: `EXPOSE 31339`.
-  - `docker-compose.yml`: a port mapping.
-  - Helm: the same six places as `quack`:
-    - `service.rest`;
-    - a `rest.enabled` toggle;
-    - `containerPort`;
-    - the configmap environment variables;
-    - the network policy;
-    - `NOTES.txt`.
-  - Nothing is exposed by default.
-  - The operator documentation covers ingress for the internet: TLS passthrough, or TLS termination
-    together with `trustedProxies`.
+- **Main.** `Option.when(cfg.enabled)(new RestEdgeServer(...))`, chained into `dataPlaneIO` after
+  the Quack door (`Main.scala:1230-1268`). A bind failure aborts boot.
+- **Banner (Q4).** Add one REST line next to the existing `SQL ACL` line. `Banner.startup` gains a
+  `rest: Option[(String, Int, Boolean)]` parameter, like `quack`:
+  ```
+     REST (data)   : https://localhost:31339/api/v1  (PAT bearer, read-only)
+  ```
+  When the ACL is disabled, the same line carries the warning, in the same style:
+  ```
+     REST (data)   : https://localhost:31339/api/v1  (ACL DISABLED: any PAT of the tenant can read every table)
+  ```
+  The same text is also logged with `logger.warn`, next to `BootFactories`' "SQL ACL disabled"
+  warning.
+- **ShutdownCoordinator.** Add `restEdge: Option[RestEdgeServer]`, stopped both in the JVM hook
+  and in `gracefulShutdown`.
+- **Helm (slice 1):**
+  - `service.rest`, and a `{{ fullname }}-rest` Service gated by `rest.enabled`;
+  - `containerPort: 31339`;
+  - `QOD_REST_ENABLED` and `QOD_REST_TLS_ENABLED` in the configmap;
+  - a NetworkPolicy ingress rule;
+  - a `NOTES.txt` block.
+
+  The Dockerfile `EXPOSE` and the docker-compose port come along with these.
+
+### 8.4 Endpoint registration and repo guards
+
+- **Registration.** Add `RestEdgeEndpoints` to `EndpointModules.all`, so that `GenOpenApi` emits
+  the endpoints and `OpenApiFreshnessSpec` pins them.
+  - Regenerate `cli/tests/resources/openapi.yaml` in the same commit.
+  - `ManagerServer` **must not** mount these endpoints. Only `RestEdgeServer` serves them.
+  - In the OpenAPI description, tag them `rest-edge` and name their port.
+- **`cli/tests/test_rest_parity.py`.** Add the four paths to `EXCLUSIONS`, with a
+  "machine-to-machine" comment, as for SCIM.
+- **`TenantScopeCompletenessSpec`.** This spec reflects over `EndpointModules` and asserts that
+  `TenantScopeGuard.extractTenant` resolves every `{tenant}` path. The REST paths are not behind
+  `apiKeyGuard`: their tenant binding is §5 step 4. Two options:
+  - **A:** add an explicit, commented exclusion for the `rest-edge` module in the spec.
+  - **B:** teach `extractTenant` the new pattern, which does no harm.
+
+  Prefer A: the spec should not claim that a guard applies when it does not.
+- **`McpCoverageSpec`** checks only mutating methods, so it is unaffected.
 
 ---
 
 ## 9. Observability
 
-- **Micrometer meters,** named the existing way (snake_case, `_total` and `_seconds` suffixes, no
-  prefix):
-  - `rest_requests_total{endpoint,format,status}`
-  - `rest_request_duration_seconds{endpoint,format}`
-  - `rest_auth_throttled_total`
-  - `rest_user_rejected_total`
+- **Slice 1:**
+  - The audit origin is `rest` on denials and on `SessionOpened` (constraint 5).
+  - Statement history and usage metering go through the router, as for every door, with `patId`
+    carried by `ExecCaller`.
+- **Slice 2:** Micrometer meters, named like the existing ones:
+  - `rest_requests_total{endpoint,format,status}`;
+  - `rest_request_duration_seconds{endpoint,format}`.
 
-  The `endpoint` label is the route **template**, which keeps its cardinality bounded.
-- **History and metering:** statement history and metering carry `source="rest"` and `patId`.
-- **Audit:** denials are audited with `origin="rest"`, through the router's existing audit.
+  `endpoint` is the route template, which keeps cardinality bounded.
 
 ---
 
-## 10. Threat model (internet-facing)
+## 10. Threat model
 
-| # | Threat | Control | Tests (§11) |
+| # | Threat | Control | Tests |
 |---|---|---|---|
-| T1 | SQL injection through a value, a column, an order term or a path segment | AST parser. Identifiers come only from the probe. Values appear only inside `duckdbLiteral` plus `CAST`. Path segments are checked against the identifier rule. | U3, U4, H6 |
-| T2 | A superuser or system path reachable from the internet | Bearer only. A tenant-null PAT gets 401. `superuserAdmissible=false`. The privileged `EffectiveSet` is selected by a typed flag that only in-process call sites set (§8.1). | R1, R2, H3 |
-| T3 | Replay of an existing PAT | `restAccess` opt-in with default `false`, a narrowing lattice and an explicit `SessionRoot` | U7, H2 |
-| T4 | Cross-tenant access | PAT owner's tenant must equal the path tenant. JWTs are validated only by the tenant's own OIDC provider. The user is looked up inside the path tenant. | R3, H16, E3 |
-| T5 | Enumerating tenants, databases, schemas, tables, tags or snapshots | A single 401 body. 404 whether the object is missing or not granted. Nothing touches the catalog before authorization (§4). Tags are never echoed. | H4, H5 |
-| T6 | Credential brute force, lookup DoS, control-plane write amplification | Per-IP throttle plus a global backstop, applied before credential work. `X-Forwarded-For` is trusted only from listed proxies. PAT `last_used_at` is written at most once a minute. | U8, U9, H7 |
-| T7 | Resource exhaustion by an authenticated caller | Row, time, filter, size and wildcard caps. Per-user and global slots, held until the node finishes. | U10, H8 |
-| T8 | Slowloris, oversized headers or URI, request desync | Ember receive timeout, header limit, connection cap. A GET with a body is refused. | H9 |
-| T9 | Policy bypass (RLS, CLS, masked-column oracle) | One pipeline (`RoutedExecutor`). S1 and S3 are pinned by tests. | P1, P2 |
-| T10 | Metadata leak through listings or built-in catalogs | Filtered `information_schema` (S5). Boot is refused without filtered metadata. Three-part names only (S7). System schemas get 404. | P4, P8, U11 |
-| T11 | Unauthenticated wake-up of a hibernated pool | The ordering in §4 | H5, E6 |
-| T12 | Tokens or personal data in logs | `Authorization` and query values are never logged. No tokens in URLs. Parameter names are sanitised. | H10 |
-| T13 | Cross-origin abuse from a browser | CORS allow-list, credentials never allowed, bearer tokens only | H11 |
-| T14 | Internal error text reaching the client | A fixed message per error code, details in server logs under the request id | H12 |
-| T15 | JWT that is unsigned, expired, has no `exp`, is foreign, or comes from a global provider | Only the tenant's own OIDC provider, plus a mandatory `exp` (S4) | H13, H16 |
-| T16 | Resource leak on timeout or disconnect | A single idempotent finalizer. Late results are closed. | U10, H8, H17 |
+| T1 | SQL injection through a value, column, order term or path segment | Pure parser. Identifiers only from the probe. Values only through `SqlLiterals` + `CAST`. Path identifier rule. One statement, through the ordinary validator. | U3, U4, H6 |
+| T2 | Superuser or static-key access | PAT bearer only. A tenant-null PAT gets 401. Never `X-API-Key`, never `ExecCaller.unrestricted`. | H3 |
+| T3 | Cross-tenant access | The owner's tenant must equal the path tenant (the `tenantOf` mirror), and `routedExecutor` looks the user up inside that tenant | H4, E3 |
+| T4 | Enumerating databases, schemas, tables or tags | The same 404 for missing and for not granted. An empty schema gets 404. Tags are never echoed. Discovery is filtered by grants. | H5, D1-D4 |
+| T5 | Policy bypass (RLS, CLS, the masked-column oracle, positional references) | One pipeline. No positional references are generated. S1 and S3 are pinned, and fixed in the rewriter if needed. | P1, P2 |
+| T6 | Leaving the tenant catalog | Three-part names from a single catalog resolver. S7. | P8, P9 |
+| T7 | Resource exhaustion | Row, time, filter, size and wildcard caps. Ember limits. Late results are closed. O-1 for rate limiting. | U1, H8, H9 |
+| T8 | Cache leakage across principals | `Cache-Control: private` and `Vary: Authorization` everywhere | H1 |
+| T9 | Tokens or personal data in logs and errors | Neither `Authorization` nor parameter values are logged. Fixed error messages. Sanitised names. | H10, H12 |
+| T10 | Request desync, slowloris | A GET with a body is refused. A header receive timeout. | H9 |
+| T11 | ACL accidentally off | A banner warning (Q4). Discovery still fails closed through filtered metadata. | U6 |
 
 ---
 
-## 11. Test design
+## 11. Tests
 
-**Conventions.** Frameworks and style follow the repo:
+**Conventions:**
 
-- ScalaTest `AnyFlatSpec with Matchers`.
-- One spec per class, mirroring the package (`src/test/scala/ai/starlake/quack/edge/rest/`).
-- Cases named for behaviour, e.g. `"RowsSql" should "never place user text outside a literal" in`.
-- **No ScalaCheck** is added, since the repo has none. Tests over generated input use a seeded
-  `scala.util.Random` loop and print the seed when they fail.
-- Tests that need `duckdb` or embedded Postgres use `assume`/`cancel`, as `QuackCompatibilitySpec`
-  and `PostgresFixture` do.
+- ScalaTest `AnyFlatSpec with Matchers`, with one spec per class under
+  `src/test/scala/ai/starlake/quack/edge/rest/`.
+- Test names describe behaviour.
+- No ScalaCheck. Generated inputs come from a seeded `scala.util.Random` loop that prints its seed.
 
-**Write each phase's tests before its implementation, red first.** The pure-core specs are the
-contract.
+**Write each spec red first.** The three specs the maintainer asked for are U, H and E below. D is
+the discovery spec required by constraint 2.
 
-### 11.1 Unit (U): pure, no network
+### 11.1 Pure specs (U): `RestQuerySpec`, `RestSqlSpec`, `RestSqlInjectionSpec`
 
-| Id | Spec | Cases (each is one `it should`) |
-|---|---|---|
-| U1 | `RowsQuerySpec` | **Accepts:** every operator; `not.`; `in` with quoted items containing `,` `)` `"` `\`; `is.null`, `is.true` and `is.false`; every combination of order suffixes; the default select. **Rejects:** an unknown operator; an empty value where one is required; unbalanced `in`; a duplicated reserved parameter; `branch`; a duplicate column in `select`; each hard cap at N+1 but not at N; NUL in a value; an invalid `%` sequence; `offset>0` without `order`; several `asOf*` at once. **Integers:** `limit`/`offset` values of `+1`, `01`, `1e3` and `2147483648` are rejected. |
-| U2 | `RowsQuerySpec` (column resolution) | ASCII case-insensitive match. An ambiguous match gives `unknown_column`. The Kelvin sign `K` (U+212A) does **not** match `k`. `LIMIT=5` is treated as a filter on a column named LIMIT. A reserved name is never read as a column (Q6). An unknown column is never ignored. |
-| U3 | `RowsSqlSpec` (golden) | Golden SQL for a matrix: every operator with `not`/`in`/`is`; LIKE escaping, with `ESCAPE` present only when something was escaped; the wildcard cap; order with nulls; `LIMIT n+1 OFFSET`; `AT` present and absent; the three-part name always; identifiers that need quoting (`"we""ird"`). **Numbers:** `1e999999999` and out-of-range values for each integer width are rejected, and DECIMAL precision and scale are enforced. |
-| U4 | `RowsSqlInjectionSpec` | **Inputs:** a fixed corpus (quotes, `\`, `;`, `--`, `/* */`, `$$`, CR/LF, Unicode look-alikes, a 4 KiB value, SQL keywords) plus 10 000 seeded random strings. Each input is tried as a **value**, and separately as a probed column **name**. **Three oracles, none of them the ACL parser.** That parser strips `AT` before parsing and does not lex exactly as DuckDB does. (1) *Structural:* a scanner that mirrors the quoting of `duckdbLiteral`/`duckdbIdent` removes every literal and quoted identifier; what remains must consist only of a closed set of tokens. (2) *Semantic:* the rendered SQL runs in in-process DuckDB (`edge/adapter/TestArrow.scala`) against a table holding the random value and a sentinel table. `eq` returns exactly that row, `not.eq` returns the rest, and the sentinel survives. (3) *Single statement:* `json_serialize_sql` on the rendered text yields exactly one statement. |
-| U5 | `RestResultEncoderSpec` | Arrow input comes from `TestArrow.readerFor(sql)`. JSON and CSV for each type family in §6.5: DECIMAL(38,10) exact; BIGINT minimum and maximum; HUGEINT as a string; NaN and ±Inf; timestamps with and without a time zone; date; BLOB as base64; nested struct, list and map; NULL at every depth. CSV quoting with embedded CRLF, and the header row. Arrow re-framing, with the row cap slicing the last batch. |
-| U6 | `RestEdgeConfigSpec` | Every refusal in §7.2, with a message that names the environment variable. A valid config passes. Edge cases in parsing CORS origins and CIDRs. |
-| U7 | `TokenRestrictionSpec` (extended) | `narrow` over `restAccess`: a child cannot be `true` under a `false` parent. `Unrestricted.restAccess == false`. `SessionRoot` allows a root mint to be `true`. |
-| U8 | `ClientAddressSpec` | Untrusted peer with an XFF header: the peer is used. Trusted peer: the right-most untrusted hop. All hops trusted: the left-most. Malformed header: the peer. `::ffff:1.2.3.4` is keyed as `1.2.3.4`. IPv6 is keyed by /64. |
-| U9 | `AuthThrottleSpec` | Uses an injected clock and Caffeine built with `executor(Runnable::run)` plus `cleanUp()`, so the test is not flaky. Blocks at N+1. A success does not reset the counter. The block expires after `authBlockSec`. The window slides. **A blocked entry survives churn of 200 000 other keys.** The global bucket takes over once it is drained. 403s from authentication count as failures; 403s from authorization do not. |
-| U10 | `UserLimiterSpec` | Enforces both the per-user and the global cap. Release is **idempotent**: after two releases the cap still holds. 10 000 seeded random sequences of acquire, release and fail leave no leaked slot. |
-| U11 | `FormatNegotiationSpec` | `format` wins over `Accept`. `parquet` and unknown values give 406. JSON is the fallback. |
+**U1: operators and rejections.**
 
-### 11.2 `RoutedExecutor` (R): the extracted class from §8.1
+- Every operator (`eq neq gt gte lt lte like ilike in is`), with and without `not.`.
+- `in` with quoted items containing `,`, `)`, `"` and `\`.
+- `is.null`, `is.true` and `is.false`.
+- Every `order` suffix, and the default select.
+- **Every rejection, each with its error code:**
+  - an unknown operator, an empty value, an unbalanced `in`;
+  - a reserved parameter given twice, `branch`, a duplicate `select` column;
+  - each cap at N+1 (and not at N);
+  - a NUL byte, an invalid `%` sequence;
+  - `offset>0` without `order` (`order_required`), and several `asOf*` at once (`invalid_selector`);
+  - `limit` values `+1`, `01`, `1e3` and `2147483648`;
+  - an exponent in a decimal, and out-of-range integers;
+  - `like` on a non-string column, and a filter or `order` on a nested column.
 
-The specs use the router fixtures of `FlightSqlRouterExecuteWithSpec.setup` and an in-memory
-supervisor.
+**U2: column resolution.**
 
-| Id | Cases |
-|---|---|
-| R1 | Only `systemCaller=true` yields the privileged set. Every other caller goes through `authorizeHandshake`, whatever its identity. Reserved internal identity names are refused by `user/create`, SCIM and manifest import. |
-| R2 | `superuserAdmissible=false` refuses a tenant-null row. `preAuthorized` skips the handshake but still applies attenuation and the `pools` axis. |
-| R3 | `jwtRoles`/`jwtGroups` reach the 6-argument `authorizeHandshake`. `source` reaches history, audit and metrics. |
-| R4 | Token timeout: a stub whose result arrives late has its `Routed.close` called exactly once, and the statement is deregistered. |
-| R5 | Every existing caller (preview, undrop, restore, branch counts, MCP) behaves exactly as before. Existing specs stay green. MCP now records `source="mcp"`. |
+- Matching is ASCII case-insensitive, and the Kelvin sign does not match `k`.
+- Ambiguous or unknown columns give `unknown_column`.
+- `reserved_column`:
+  - `limit=eq.5` on a table with a `limit` column gives `reserved_column`;
+  - `limit=5` stays a limit either way;
+  - `order=eq.asc` on a table with a column named `eq` is an ordinary order.
 
-### 11.3 HTTP (H): the real `RestEdgeServer`, stubbed collaborators
+**U3: golden SQL.**
 
-**Harness.** Copied from `QuackFrontDoorServerSpec`:
+- The operator matrix, and LIKE escaping (with `ESCAPE` only when needed).
+- The three-part name for each kind (`"memory"."main"."t"` for `memory`).
+- `AT` present and absent, and `LIMIT n+1 OFFSET`.
+- **Never** an ordinal in `ORDER BY`, and never `*` in the data statement.
 
-- `freePort()`, `withServer`, the JDK `HttpClient`;
-- a trust-all `SSLContext` with `CertGen` for TLS;
-- **raw `java.net.Socket`** wherever the JDK client would normalise the request away (H9, H17).
+**U4: injection.** A corpus plus 10 000 seeded strings, each used both as a value and as a probed
+column name, checked by three oracles:
 
-**Stubs:**
+1. A structural scanner that mirrors `SqlLiterals` quoting leaves only a closed set of tokens.
+2. Executed in in-process DuckDB (`edge/adapter/TestArrow.scala`), `eq` returns exactly the
+   matching row, `not.eq` returns the rest, and a sentinel table survives.
+3. `json_serialize_sql` sees exactly one statement.
 
-- **Executor:** a recording `PreviewExecutor`, modelled on `McpDataToolsSpec.capturingExecutor`
-  (`src/test/.../mcp/McpDataToolsSpec.scala:247`). It has call counters and can be gated on a
-  `CountDownLatch` or `Deferred` so concurrency tests are deterministic.
-- **Logs:** a logback `ListAppender` testkit, new; logback-classic is already on the classpath.
-- **JWT:** `security/MockOidcServer` plus `JwtTestSigner`, which gains a `mintRaw(claims, header)`
-  helper to produce tokens with no `exp` and with `alg=none`.
+**U5: encoder.**
 
-| Id | Cases |
-|---|---|
-| H1 | **Happy path** for each endpoint and format: status, body and headers. The captured calls show that the probe and data SQL carry the same `AT` id, which equals `X-QoD-Snapshot`. The captured `ExecCaller` has `source="rest"`, `systemCaller=false`, `preAuthorized` set and the right `patId`. Non-DuckLake `asOf` gives `time_travel_unsupported`, with no `AT` and no header. A listing capped at `maxRows` sets `X-QoD-Truncated`. |
-| H2 | **PAT mapping** (stubbed store). A PAT without `restAccess` gets 403 `rest_access_denied`. A resolver returning `None` gets the uniform 401. One case gated on Postgres goes through the real `PatAuthenticator.resolve` for revoked, expired and disabled-owner tokens. |
-| H3 | **Credentials.** A superuser PAT gets a 401 byte-identical to a bad token's, body and headers. `X-API-Key` alone, `Basic`, a cookie, or two `Authorization` headers: 401. A token of exactly 8 KiB is accepted; 8 KiB+1 gets 401. A lower-case `bearer` scheme is accepted; two spaces after the scheme get 401. `?access_token=` with no bearer gets 401; with a valid bearer it gets 400 `unknown_column`, and the value is never used as a credential. |
-| H4 | **Uniform responses.** Unknown tenant vs. known tenant with a garbage token: byte-identical 401s. Missing table vs. denied table: byte-identical 404s, with the same number of executor and store calls (a structural check, not timing). Missing database vs. a database outside the `databases` axis: byte-identical 404s. An empty schema listing gets 404. A tag-not-found message never echoes the tag. |
-| H5 | **Nothing before authorization.** On every 401, 403, 429 and step-7 denial, the executor, the catalog reader and the snapshot selector are called **zero** times. |
-| H6 | Path segments containing `..`, `%2F`, quotes, too many characters, `information_schema` or `pg_catalog` get 404, and the stub sees nothing. |
-| H7 | **Throttle.** After 20 bad tokens, the 21st request gets 429 even with a valid token. XFF from an untrusted peer is ignored. With `trustedProxies=127.0.0.1/32`, different XFF clients get **separate** budgets. A flood of 403 authorization denials and 404s from a valid PAT is not throttled. |
-| H8 | **Concurrency.** The stub latches 4 calls; the 5th request gets 429. Two PATs belonging to the same user share one budget. **Timeout:** an injected `FiniteDuration` seam produces a 504, and the slot stays held until the stub completes, then is freed exactly once. |
-| H9 | **Framing, over a raw socket.** A 17 KiB header gets 431 (or whatever Ember returns, pinned by S6). A slow header with `headerReceiveTimeoutSec=1` has its connection closed. `GET` with `Content-Length: 1000000000` and no body gets 400 immediately, with `Connection: close`. `POST`, `PUT`, `DELETE` and `HEAD` get 405. |
-| H10 | **Logs.** The `ListAppender` shows that no token and no parameter value appears in any log line during H1 to H9. For example, a bad operator on `email=eq.secret@x.io` leaves `secret` out of both the log and the 400 body. Hostile parameter names (CRLF, 10 KiB) are sanitised. |
-| H11 | **CORS.** No CORS headers when disabled. An allowed origin is echoed with `Vary: Origin`; a disallowed one gets no allow-origin header. `Access-Control-Allow-Credentials` never appears. Preflight works. |
-| H12 | **Errors.** A stub that throws with a secret-looking message produces a 502 whose body omits the message but carries the request id; the log contains the message. Security headers and `X-Request-Id` are present on 4xx and 5xx responses generated by Ember and Tapir themselves (431, 405, decode failure, malformed-segment 404). A client-supplied `X-Request-Id` is not echoed. |
-| H13 | **JWT**, using the real `AuthenticationService` and a tenant `MockOidcServer`. Valid: 200. No `exp`: 401. Expired: 401. Wrong `aud` or `iss`: 401. `alg=none`: 401. A tenant with no OIDC provider: 401 (S4). |
-| H14 | **TLS.** The handshake succeeds with generated certificates. HSTS appears on every response, errors included. |
-| H15 | `GET /api/v1/openapi.json` equals the golden file `src/test/resources/rest/openapi-v1.json`. |
-| H16 | **Global providers refused.** A token signed by the global HS256 `jwt` provider, and one from a global OIDC provider, both get 401 on REST while still working on FlightSQL. |
-| H17 | **Disconnect and abort.** A client that closes its socket mid-stream causes `Routed.close` to run exactly once and frees the slot. A reader that throws after the first batch leaves the client with an incomplete chunked stream or a reset, never a parseable JSON array or CSV. |
+- JSON and CSV for each type family: DECIMAL(38,10) exact, BIGINT bounds, HUGEINT as a string,
+  NaN/±Inf, timestamps with and without a zone, date, BLOB as base64, nested types, and NULL at
+  every depth.
+- CSV quoting with CRLF.
+- Inputs come from `TestArrow.readerFor(sql)`.
 
-### 11.4 Pipeline (P): the real policy rewriters, in two tiers
+**U6: config.**
 
-- **Text tier.** `FlightSqlRouterSpec.setupWithRewriter` (`src/test/.../edge/FlightSqlRouterSpec.scala:942`)
-  captures the SQL after policy has been applied. Policy fixtures: `effWithPolicies`,
-  `effWithRowPolicies`, `maskCustomerEmail`, `rowPolicyCustomer` (`:934`, `:1123-1145`).
-- **Semantic tier.** The captured, rewritten SQL is executed in in-process DuckDB over seeded tables,
-  which needs no Postgres.
+- Numeric validation and the port clash.
+- The banner line and the WARN when the ACL is disabled.
 
-| Id | Cases |
-|---|---|
-| P1 | **S1.** In the text tier, `AT (VERSION => n)` on a three-part reference survives both the CLS and the RLS rewriter, and the policy is still applied. In the semantic tier, RLS filters the rows. CLS: a masked column carries the masked value, and a column dropped by CLS gives `unknown_column` whether it appears in `select`, `order` or a filter. |
-| P2 | **S3, the masked-column oracle.** Use a mask that **keeps partial information** (`left(ssn,3)||'***'`), and data whose raw ordering and raw `LIKE` matches differ from the masked ones. Then `like`, `gt`, `is.null` and `order` on the masked column must produce exactly what the same operations produce over the masked values, or the request must get 400. With a constant mask the test would pass trivially, so this data is required. The test is written **before** S3 is resolved: it starts red and forces the decision. |
-| P4 | **S5.** Listings return only granted schemas and tables. A view is reported as `view`. An attached federated catalog is never listed. |
-| P8 | **S7.** The rendered three-part name stays inside the tenant catalog, for each kind (including `memory`), even for a principal holding a schema-wide `*` grant. |
-| P9 | **Session-catalog parity.** For every kind and metastore shape (`catalogAlias` set, only `dbName`, empty for `memory`), the router's `ValidationContext.defaultDatabase` equals the REST `<catalog>`. Both come from `SessionCatalog.of`, and this test keeps them from drifting apart. |
+**U7: format negotiation.**
 
-### 11.5 End-to-end (E): real node and real DuckLake
+- `format` wins over `Accept`.
+- `arrow` and `parquet` get 406 in slice 1.
+- The fallback is JSON.
 
-Gated on `duckdb` being present and on embedded Postgres. The spec, `RestEdgeEndToEndSpec`, builds
-on:
+### 11.2 The edge over the executor seam, without the wire (H): `RestEdgeHandlersSpec`
 
-- `PreviewEndToEndSpec.withRouter` (`src/test/.../it/PreviewEndToEndSpec.scala:84`);
-- `PostgresFixture.withCatalog` and `runSqlOnCatalog`;
-- a `RestEdgeServer` on a free port.
+**Harness.** `RestEdgeHandlers` is built with a **recording `PreviewExecutor`** stub, modelled on
+`McpDataToolsSpec.capturingExecutor` (`src/test/.../mcp/McpDataToolsSpec.scala:247`).
 
-| Id | Cases |
-|---|---|
-| E1 | The happy path in all three formats, against a real DuckLake table and a real view. |
-| E2 | **S2 and consistent pagination.** Read page 1. Commit an insert that sorts **before** the page-2 cursor, and a delete. Read page 2 with `asOf=<X-QoD-Snapshot>`. The two pages together must equal the ordered set as it was before the changes. Repeat on a view, following the outcome of S2. |
-| E3 | Cross-tenant: a tenant-B PAT or JWT on a tenant-A path is refused. |
-| E4 | With `pat.maxRows` smaller than `maxRows` smaller than `limit`, the smallest cap wins, and `X-QoD-Truncated` is set. |
-| E5 | History and metrics: the history row has `source='rest'` and the `pat_id`. `statements_total{source="rest"}` goes up. |
-| E6 | **Hibernation, split so each case is deterministic.** (a) A suspended pool whose node becomes routable within the hold: 200. (b) A hold that expires: 503 `pool_resuming` with `Retry-After`. (c) An unauthorized request leaves the pool suspended. |
-| E8 | **Every kind.** E1 and the listing endpoints run against a `ducklake`, an encrypted `duckdb-file` and a `memory` tenant-db. On the two non-DuckLake kinds, `asOf` gives `time_travel_unsupported`, and there is no `AT` and no `X-QoD-Snapshot`. The `memory` statement is qualified `"memory"."main"."t"`. The probe and data statement land on the same node (captured `nodeId`). A branch tenant-db addressed by its name gets 404. |
-| E7 | **S8 measurement.** Time the worst-case pattern allowed by the wildcard cap, and record it in §2.4. |
+- The stub counts calls, can block on a latch, and returns canned Arrow data built with
+  `TestArrow`.
+- The PAT resolver and the supervisor are the in-memory fixtures that the MCP specs use.
+- A second, small spec, `RestEdgeServerSpec`, covers what only the wire can show (H9, H11, H12). It
+  uses the harness pattern of `QuackFrontDoorServerSpec`: `freePort()`, and raw sockets wherever
+  the JDK client would normalise the request.
 
-### 11.6 Cross-surface and regression
+**H1: happy path**, for each endpoint and format.
 
-- The existing `FlightSqlRouter*`, `QuackFrontDoor*`, MCP and `Pat*` specs stay green, changed only
-  by the new `source` expectations.
-- `cli/tests/test_rest_parity.py` stays green once `openapi.yaml` is regenerated (the new
-  `--rest-access` flag). `McpCoverageSpec` is not affected.
-- Liquibase: the embedded-Postgres migration spec applies both new changesets, to an empty schema
-  and to one that already has rows.
-- `SqlLiteralsSpec` is extended with NUL, CR/LF and backslash cases.
-- If the operator skill is edited: `test_skill_freshness.py`, after refreshing the bundled copy.
+- The captured `ExecCaller` has `source="rest"`, the right `patId` and
+  `connectionId = rest-<patId>`, and is never `unrestricted`.
+- The probe and the data SQL carry the same `AT` id, which equals `X-QoD-Snapshot`.
+- The pinned `preferredNode` equals the probe's node.
+- `Cache-Control: private` and `Vary: Authorization` are present. `max-age` appears only when
+  `asOf` is pinned.
 
-### 11.7 Security checklist before release (manual, not CI)
+**H2: tools axis.**
 
-- An OWASP ZAP baseline scan against a docker-compose deployment with a seeded tenant, run with a
-  valid PAT and with no credential.
-- `testssl.sh` against the TLS listener.
-- A review of every WARN and ERROR line the H suite produces, looking for data that should not be
-  there.
+- `tools=None` is admitted, and `tools={rest}` is admitted.
+- `tools={run_sql}` gets 403.
+- A `branchOnly` token is admitted, and its statement is classified READ.
+
+**H3: credentials.**
+
+- A superuser PAT gets a 401 that is **byte-identical** to the 401 for a garbage token.
+- `X-API-Key`, `Basic`, a cookie, two `Authorization` headers, `?access_token=` alone, and a
+  non-PAT bearer (slice 1) all get 401.
+- A token of 8 KiB is accepted; one byte more is refused.
+- The scheme is matched case-insensitively.
+
+**H4: tenant.** A PAT from another tenant and an unknown path tenant get the same 403, and the
+executor is never called.
+
+**H5: identical 404s.** In each case the body, the headers and the executor call count are
+identical:
+
+- a missing table versus an ungranted one (the stub returns `NotFound` or `AccessDenied`);
+- a missing database versus one outside the `databases` axis;
+- a branch tenant-db;
+- an empty schema.
+
+A tag-not-found message never echoes the tag.
+
+**H6: path segments.** `..`, `%2F`, quotes, over-long names, `information_schema` and `pg_catalog`
+all get 404, and the stub sees nothing.
+
+**H7: limits.**
+
+- Cap precedence between `maxRows`, the PAT's `maxRows` and `limit`. `X-QoD-Truncated` is set only
+  when a cap cut the page.
+- `order_required`.
+- A non-DuckLake `asOf` gets `invalid_kind`, and the SQL carries no `AT`.
+
+**H8: timeouts and resuming pools.**
+
+- An injected `FiniteDuration` seam produces 504, and a late `Routed` is closed exactly once.
+- A resuming pool gets 503 `pool_resuming` with `Retry-After`.
+
+**H9: wire, over a raw socket.**
+
+- A 17 KiB header gets 431 (or whatever S6 pins).
+- A slow header gets the connection closed.
+- A GET with `Content-Length: 1000000000` gets 400 with `Connection: close`.
+- `POST` and `HEAD` get 405.
+
+**H10: logs**, captured with a logback `ListAppender` testkit.
+
+- No token and no parameter value appears anywhere.
+- A bad operator in `email=eq.secret@x.io` keeps `secret` out of both the log and the body.
+- Hostile parameter names are sanitised.
+
+**H11: headers.** Security headers and `X-Request-Id` are present on errors generated by Ember and
+Tapir too. A client's `X-Request-Id` is not echoed.
+
+**H12: upstream errors.** A stub that throws a secret-looking message produces a 502 that carries
+the request id but not the message.
+
+### 11.3 Discovery fails closed (D): `RestDiscoveryScopeSpec`, in the style of `RbacTenantScopeSpec`
+
+**Harness.** The `security/ManagerServerHarness` fixtures (`InMemoryControlPlaneStore`, grants).
+The executor is wired to the router's real text pipeline (`FlightSqlRouterSpec.setupWithRewriter`,
+which captures the post-rewrite SQL), and in-process DuckDB provides the semantics.
+
+- **D1.** For each of the three kinds (S5), the `schemas`, `tables` and table-detail listings
+  contain exactly the objects the principal holds a Read-covering grant on.
+- **D2.** For each of `/tables/{t}`, `/tables/{t}/rows` and `/schemas/{s}/tables`, an ungranted
+  object and a missing object get byte-identical 404s.
+- **D3.** CLS:
+  - a dropped column is absent from the detail;
+  - naming a dropped column in `select`, `order` or a filter gets `unknown_column`;
+  - a masked column is listed as an ordinary column.
+- **D4.** With `filteredMetadata=false` and no grant on `information_schema`, the listings return
+  404, not an unfiltered list.
+
+### 11.4 Pipeline and end-to-end (P, E)
+
+**Pipeline specs** use the router's text pipeline plus in-process DuckDB:
+
+- **P1 (S1).** `AT` on a three-part reference survives CLS and RLS, and the policy still applies.
+  RLS filters `/rows` in combination with filters and ordering.
+- **P2 (S3).** Use a mask that keeps partial information (`left(ssn,3)||'***'`), and data whose raw
+  and masked sort orders and LIKE matches differ. `like`, `gt`, `is.null` and `order` on the masked
+  column must match what the same operations give on the masked values. The test is written first
+  and stays red until the rewriter satisfies it.
+- **P8 (S7).** For every kind, including `memory`, a three-part name stays inside the tenant
+  catalog, even under a schema-wide `*` grant.
+- **P9.** For every kind and metastore shape, the router's `defaultDatabase` equals the edge's
+  `<catalog>`, because both come from one resolver.
+
+**`RestEdgeEndToEndSpec`** (E) follows the style of `QuackCompatibilitySpec` and
+`PreviewEndToEndSpec.withRouter` (`src/test/.../it/PreviewEndToEndSpec.scala:84`). It runs a live
+pool spawned through `LocalQuackBackend`, with a `RestEdgeServer` on a free port.
+
+It **must stay green while a developer manager is running on `:20900`**, so:
+
+- every listener binds `freePort()`, never 31339, 9494, 31338 or 20900;
+- node ports come from a range outside the manager's `21900-22500`, or from `freePort()`;
+- the control plane and the catalogs use `PostgresFixture` or embedded Postgres with their own
+  database names, never the live `qod` database or its tenant-db databases;
+- the spec never calls `scripts/kill-quack-nodes.sh`, and tears down only the nodes it spawned;
+- the spec is cancelled when `duckdb` is missing.
+
+End-to-end cases:
+
+- **E1.** Every endpoint, in JSON and CSV, against a real DuckLake table and a real view.
+- **E2 (pagination).** Read page 1. Commit an insert that sorts **before** the page-2 cursor, plus
+  a delete. Page 2, read with `asOf=<X-QoD-Snapshot>`, still matches the original set. The same
+  check on a view, subject to S2.
+- **E3.** A tenant-B PAT on a tenant-A path is refused.
+- **E4.** Cap precedence.
+- **E5.** A denial is audited with origin `rest`, and history shows the statement with the PAT id.
+- **E6 (cold start).** A suspended pool either resumes within the hold (200) or answers 503
+  `pool_resuming` once the hold expires.
+- **E7.** The S8 measurement, recorded in §2.5.
+- **E8.** Every kind: `ducklake`, an encrypted `duckdb-file`, and `memory` (qualified
+  `"memory"."main"`). A non-DuckLake `asOf` gets `invalid_kind`.
+
+### 11.5 Repo guards that must stay green
+
+- `OpenApiFreshnessSpec`, with `openapi.yaml` regenerated.
+- `cli/tests/test_rest_parity.py`, with the new exclusions.
+- `TenantScopeCompletenessSpec`, per the choice made in §8.4.
+- `McpCoverageSpec`.
+- `GenConfigDocsSpec`.
+- Every existing `FlightSqlRouter*`, `QuackFrontDoor*`, MCP and PAT spec. The new `source` and
+  `preferredNode` fields default to today's behaviour.
 
 ---
 
-## 12. Implementation plan
+## 12. PR plan
 
-Each phase is a PR-sized series of commits. A phase lands together with its tests, keeps `sbt test`
-green, and starts only once its gate is closed.
+**PR 1 (slice 1):**
 
 | Phase | Content | Gate |
 |---|---|---|
-| **P0** | Spikes S1 to S8. Each ends in a committed test that pins the finding, plus an update to §2.4. | none |
-| **P1** | §8.1: extract `RoutedExecutor`; typed `systemCaller`; reserve internal identity names; thread `source`, `preAuthorized` and `superuserAdmissible`; close late results; history column and metrics tag. PAT `last_used_at` throttling (§5.2). Tests: R1 to R5, 11.6. | none. Independent of the decisions, and useful even without REST. |
-| **P2** | PAT `restAccess`: Liquibase, `TokenRestriction` plus `SessionRoot`, `PatStore`, the REST DTO, MCP, CLI, UI, and regenerating `openapi.yaml`. Tests: U7, CLI parity. | Q2 confirmed (P-3) |
-| **P3** | Pure core: `RowsQuery`, `RowsSql`, `RestResultEncoder`, format negotiation. Tests: U1 to U5, U11. | S8 for the wildcard cap. The S3 shape switch lands in P4. |
-| **P4** | Integration of snapshot, probe and render, plus the `SessionCatalog.of` extraction and the probe-node pin (§6.7). Tests: P1, P2, P4, P8, P9. | S1, S2, S3, S7 |
-| **P5** | Server shell: `RestEdgeConfig` and its validation, `RestEdgeServer`, `RestAuth`, `AuthThrottle`, `ClientAddress`, `UserLimiter`, the endpoints, OpenAPI, wiring, shutdown and banner. Tests: U6, U8 to U10, H1 to H17, E1 to E8. | S4, S5, S6. Q1, Q3 and Q4 confirmed. |
-| **P6** | Deployment and documentation: Dockerfile, compose, Helm. README: ports, a new section, the architecture diagram, the config table. CLAUDE.md: four sockets become five. CHANGELOG: a 0.9.5 heading and entry. Operator skill plus its bundled copy, including the deployment guidance from §7.1 and §7.3 (WAF, `trustedProxies`, NAT collateral) and P-9's IdP note. | P5 |
+| 1a | Spikes S1-S3 and S5-S8 as committed tests (P1, P2, P8, P9, E7). Any policy gap is fixed **in the rewriter or validator**, in a commit of its own. | none |
+| 1b | The §8.1 plumbing (`source`, `preferredNode`), extraction of the catalog resolver, and closing late results in `routedExecutor`. | none |
+| 1c | The pure core: `RestQuery`, `RestSql`, the encoder, format negotiation. Tests U1-U7. | S8 |
+| 1d | `RestEdgeHandlers`, `RestEdgeServer`, config, banner, wiring, shutdown, and endpoint registration with the guards (§8.4). Tests H1-H12, D1-D4, E1-E8. | S1-S3, S5-S7 |
+| 1e | Helm port and Service; Dockerfile and compose; the configuration-reference block (O-2); README ports and section; CLAUDE.md (four sockets become five); a CHANGELOG entry; the operator skill and its bundled copy, including the O-1 deployment requirement. | 1d |
+
+**PR 2 (slice 2):**
+
+| Phase | Content | Gate |
+|---|---|---|
+| 2a | OIDC bearer (§5.3), with its own tests: a valid token, no `exp`, expired, wrong `aud`/`iss`, `alg=none`, and a global provider refused. | PR 1 merged |
+| 2b | Arrow IPC and Parquet, streamed. Parquet needs either a writer dependency or a node-side `COPY`; decide in the PR. Abort the connection on an error after the first byte. | PR 1 merged |
+| 2c | CORS (`corsAllowedOrigins`): exact origins or `*`, never credentials, `Vary: Origin`. | PR 1 merged |
+| 2d | Prometheus metrics (§9). | PR 1 merged |
+| 2e | The O-1 abuse controls, **only if the maintainer agrees**. | maintainer |
 
 ---
 
 ## 13. Code-style notes for the implementor
 
-These notes come from the surrounding code, not from general preference.
+- **Syntax and formatting.** Scala 3 indentation syntax, `final case class` and `final class`,
+  scalafmt 3.10 (`maxColumn = 100`). Run `sbt scalafmtAll` before every commit.
+- **Comments.** Every class and object gets a Scaladoc that explains **why** it exists, citing this
+  spec where a decision is not obvious, as the Quack door does. Inline `//` comments state
+  rationale and invariants, not narration; the comment blocks in `routedExecutor` show the expected
+  density.
+- **Errors:**
+  - an `enum` ADT for the edge's own failures, shaped like `RouterFailure`;
+  - `Either[String, _]` for validation;
+  - `(StatusCode, ErrorResponse)` at the Tapir boundary, with snake_case codes;
+  - throw only at boot.
+- **Handlers** return `IO[Either[(StatusCode, ErrorResponse), A]]`, with pre-built error `val`s as
+  in `PatHandlers`. Blocking work runs in `IO.blocking`.
+- **Test seams** are constructor function parameters with safe defaults (the executor, the clock,
+  the timeout). No mocking libraries.
+- **Reuse; never add a parallel helper** (constraint 1). Reuse `SqlLiterals.duckdbIdent` and
+  `duckdbLiteral`, `SnapshotSelector`, `PoolPicks.readPoolKey`, `ExecCaller.effectiveMaxRows`,
+  `PatAuthenticator.resolve` and the `McpToolArgs.tenantOf` semantics. Do not add a sixth private
+  `quoteIdent`.
+- **Keep the edge thin.** No policy code in `edge/rest/`. When a test exposes a policy gap, fix the
+  validator or rewriter, in a commit of its own.
+- **Keep files small.** `Main.scala` gets wiring only, and feature files run 100-400 lines.
+- **Commits** follow Conventional Commits (`feat(rest): …`, `test(rest): …`): a subject under 70
+  characters, a body that explains why, and one logical unit per commit.
+- **Config.** Every scalar gets an `${?QOD_REST_*}` override and an `@ConfigField`. Never edit the
+  bundled `application.conf` for local tweaks.
+- **Local suite.** Run `sbt test` with a live manager on `:20900` before pushing (§11.4).
 
-- **Syntax and formatting.** Scala 3 indentation syntax, `final case class` / `final class`, and
-  scalafmt 3.10 (`maxColumn = 100`, `align.preset = more`). Run `sbt scalafmtAll` before every
-  commit.
-- **Comments.**
-  - Give every class and object a Scaladoc that explains **why** it exists. Where a decision is not
-    obvious, cite this spec (`docs/superpowers/specs/2026-09-25-quack-rest-data-edge-design.md`), as
-    the Quack door and `PatHandlers` do.
-  - Use inline `//` comments for rationale and for what must not change. Do not narrate the code.
-  - Existing examples of the expected density: the comment blocks in `routedExecutor`
-    (`Main.scala:1391-1400`, `1496-1506`).
-- **Errors.**
-  - The edge's own failures are an `enum` ADT (`enum RestFailure(val code: String, val status:
-    StatusCode)`), shaped like `RouterFailure` (`edge/RouterFailure.scala`).
-  - Validation returns `Either[String, _]`.
-  - At the Tapir boundary, errors are `(StatusCode, ErrorResponse)`, with error codes as
-    snake_case slugs.
-  - Only boot code throws.
-- **Handlers** return `type Out[A] = IO[Either[(StatusCode, ErrorResponse), A]]`, with the error
-  values built once as `val`s, as `PatHandlers` does (`ondemand/api/PatHandlers.scala:83-119`).
-  Blocking and JDBC work goes in `IO.blocking`.
-- **Test seams** are constructor function parameters with safe defaults, such as
-  `clock: () => Instant = () => Instant.now()`, `executor: PreviewExecutor`, or a timeout
-  `FiniteDuration`. Do not use mocking libraries.
-- **Reuse instead of duplicating.**
-  - Use `SqlLiterals.duckdbIdent` and `SqlLiterals.duckdbLiteral`. Do **not** add a sixth private
-    `quoteIdent`: copies already exist in `CatalogPreviewHandlers`, `CatalogUndropHandlers`,
-    `CatalogRestoreHandlers`, `DuckLakeInitializer` and `QuackFrontDoor`.
-  - Reuse `SnapshotSelector`, `PoolPicks.readPoolKey`, `ExecCaller.effectiveMaxRows` and
-    `PatAuthenticator.resolve`.
-- **Keep `Main.scala` thin.** Only wiring goes there. Logic belongs in `edge/rest/` and in the
-  extracted `RoutedExecutor`.
-- **Keep files small.** Feature files in the repo run 100 to 400 lines. If the Tapir endpoint
-  object grows toward the 64 KB `<clinit>` limit, split it (`ondemand/api/PatEndpoints.scala:9-11`).
-- **Commits** follow Conventional Commits (`feat(rest): …`, `test(rest): …`, `refactor(exec): …`),
-  with a subject under 70 characters and a body that explains why (`CONTRIBUTING.md`). Each commit
-  is one logical unit.
-- **Config.**
-  - Every new scalar gets an `${?QOD_REST_*}` override and an `@ConfigField` annotation.
-  - Never tell users to edit the bundled `application.conf`.
-- **Respect CLAUDE.md "Things to avoid".** In particular, refresh the bundled copies whenever
-  `scripts/` or the operator skill changes.
+---
+
+## Appendix A: earlier author decisions replaced by the maintainer's answers
+
+| Earlier (revision 1) | Now | Reason |
+|---|---|---|
+| A new PAT column `rest_access` (opt-in, via Liquibase) | The `tools` axis with the reserved name `rest`. Unrestricted PATs are admitted. | Q2: no new column, no Liquibase |
+| OIDC in v1, validated by the tenant's own provider | Slice 2 | Q3: nothing on the HTTP side validates JWTs today |
+| Boot refused when the ACL or `filteredMetadata` is off | A banner warning; discovery still fails closed | Q4 |
+| Reserved names treated as filters silently | 400 `reserved_column` | Q6 |
+| `asOf` on a non-DuckLake database gave `time_travel_unsupported` | `invalid_kind` | Follows the preview endpoint's rules |
+| The edge authorized before resolving the snapshot (a `preAuthorized` path and an extracted `RoutedExecutor`) | Authorization stays inside `routedExecutor`; the snapshot follows the preview rules | Keep the edge a thin translator |
+| A `source` column in history and a `source` metrics tag | `source` passed to `executeWith` only, as the native door does | Constraint 5 |
+| A standalone `/api/v1/openapi.json` | Endpoints registered in `EndpointModules` for `GenOpenApi` | Constraint 6 |
+| A per-IP throttle and a per-user cap in v1 | Proposed for slice 2 (O-1); a WAF is required until then | Not in the maintainer's slices |
+| Arrow in v1, Parquet parked | Arrow and Parquet in slice 2, streamed | Slicing |
+| `Cache-Control: no-store` | `private` + `Vary: Authorization`, with `max-age` only for pinned snapshots | Cacheable GET resources are the point of this door (§1.1) |
