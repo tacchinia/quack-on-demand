@@ -31,7 +31,8 @@ pass. Their findings are merged into the relevant sections, not appended.
 
 ### Goals
 
-1. Give read-only HTTP access to the tables and views of a tenant-db, discovered dynamically with
+1. Give read-only HTTP access to the tables and views of a tenant-db **of any kind registered on
+   QoD** (`ducklake`, `duckdb-file`, `memory`; see §6.7), discovered dynamically with
    no per-endpoint configuration. To expose a curated contract, create a view and grant it.
 2. Run every data statement through the **same** policy pipeline as FlightSQL, the Quack door and
    MCP. That pipeline covers ACL, CLS, RLS, filtered metadata, PAT attenuation, pool kill switches
@@ -56,7 +57,9 @@ pass. Their findings are merged into the relevant sections, not appended.
 - **Deferred:**
   - **Branch reads** are parked (P-2). The `branch` parameter name is reserved now.
   - **Federated and attached catalogs** are parked (P-5). v1 exposes only the tenant-db's own
-    catalog (`TenantDb.catalogAlias`).
+    session catalog, whose name depends on the kind (§6.7).
+  - **Branch tenant-dbs** (rows with `branchOf` set) cannot be addressed through the `database`
+    path segment in v1. That follows from parking branch reads (P-2).
   - **Parquet output** is parked (P-1).
 
 ---
@@ -90,7 +93,7 @@ maintainer answers differently, only the sections listed under "Impacts" re-open
 | Q1 | Path prefix and versioning | `/api/v1/tenant/{tenant}/database/{tenantDb}/...` on the dedicated port, as the issue proposes. | A separate listener cannot collide with the manager's `/api`, and `v1` leaves room for a breaking change later. |
 | Q6 | A column whose name is a reserved parameter | **Cannot be filtered in v1.** This is documented; the workaround is a view that renames the column. | Every escape syntax adds grammar for a rare case, and one can be added later without breaking anything. |
 | - | JWT issuers accepted | **Only the path tenant's own OIDC provider** (`TenantOidcRegistry.forTenant`). The global HS256 `jwt` provider and the global OIDC providers are **not** accepted on REST. | A global IdP's usernames are not tenant-scoped, so the path would choose the tenant (§5.3). See P-9. |
-| - | Non-DuckLake tenant-dbs (`duckdb-file`, `memory`) | Served. `asOf*` returns 400 `time_travel_unsupported` (only after authorization, §4) and no snapshot header is sent. | These databases have no snapshots, but reads are still useful. |
+| - | Non-DuckLake tenant-dbs (`duckdb-file`, `memory`) | Served, with the same endpoints, grammar, formats and policies. `asOf*` returns 400 `time_travel_unsupported` (only after authorization, §4). No snapshot header is sent, and pagination is only best-effort. The full rules per kind are in §6.7. | These databases have no snapshots, but reads are still useful. |
 | - | Unknown query parameter | 400 `unknown_column`, never silently ignored. | A typo in a filter must not return a bigger, unfiltered result. |
 | - | Token in the URL (`?access_token=`) | Never accepted. | URLs end up in proxy logs, browser history and `Referer` headers. |
 | - | Duplicate column in `select` | 400 `invalid_parameter`. | A JSON object cannot carry two keys with the same name. |
@@ -103,7 +106,7 @@ maintainer answers differently, only the sections listed under "Impacts" re-open
 | P-2 | Branch reads (`branch=<name>`) | Add in v1.1, using the same resolution as FlightSQL: `BranchService.resolveTarget`, called after authorizing the parent pool (`Main.scala:1198-1219`). | nothing |
 | P-3 | Maintainer confirmation of §2.1 and §2.2 | Phases P0, P1 and P3 of §12 do not depend on those decisions and can start now. | P2, P4 and later phases |
 | P-4 | **Durable node-side cancellation.** The token timeout in `routedExecutor` is a bounded wait, not a cancellation (`Main.scala:1507-1520`, see the comment at `:1496-1506`). The node cancel handle is attached only once streaming starts (`edge/ActiveStatementRegistry.scala`, `attachCancel`). | Do not add cancellation in this feature. Mitigation: the per-user slot is released only when the node call has really finished (§7.4), so repeated timeouts cannot pile up orphaned work on the node. | nothing |
-| P-5 | Exposing federated or attached catalogs | Out of scope for v1. Every name is catalog-qualified with the tenant-db alias (§6.4). | nothing |
+| P-5 | Exposing federated or attached catalogs (`sql` sources and typed `iceberg_rest` sources, which are attached to a tenant-db's nodes and governed by ACL through their alias) | **Out of scope for v1** (author's decision). Every name is qualified with the session catalog (§6.7), so these catalogs can be neither addressed nor listed. Adding them needs three things. (1) A path level, `.../database/{tenantDb}/catalogs/{alias}/schemas/...`. (2) A filtered listing for attached catalogs: `MetadataFilterRewriter.readGrants` only admits grants on the session catalog (`edge/meta/MetadataFilterRewriter.scala:223-228`), so this needs either an extension there or a listing derived from the `EffectiveSet`. (3) A spike on `AT (VERSION => n)` against Iceberg and on the source's reachability (a source that cannot be reached leaves its catalog absent on a node that is otherwise healthy). Reads would then carry no QoD snapshot unless that spike says otherwise. | nothing |
 | P-6 | Throttle state across HA replicas | Keep it per replica, in memory, and document it. With N replicas, the effective failed-auth budget is N times the configured value. | nothing |
 | P-7 | A requests-per-second budget per user | Later. The `qodstate_pat.rate_per_min` column is already reserved and unused (`src/main/resources/db/changelog/0033-pat-scope.yaml:24-25`). | nothing |
 | P-8 | Advertising the REST port in `/api/config/client` (for the UI connect panel and the CLI) | Only if the UI grows a REST connect snippet. | nothing |
@@ -119,9 +122,9 @@ Each spike ends in a test that stays in the suite.
 | S2 | Does DuckLake accept `AT (VERSION => n)` on a **view**? | Consistent pagination over views. If views do not support it, they are served at the current snapshot, `asOf*` on a view returns 400 `time_travel_unsupported`, and no snapshot header is sent. That weakens the contract for exactly the objects §1 recommends exposing, so the maintainer must be told either way. | P4 |
 | S3 | After rewriting, does a `WHERE` or `ORDER BY` on a CLS-masked column act on the **raw** value or the **masked** one? | If it acts on the raw value, a filter such as `ssn=like.123*` becomes an oracle on the unmasked data, observable from which rows come back. If so, the renderer places filters and ordering **outside** a derived table whose inner `SELECT *` the CLS rewriter masks, and S3 must prove that the inner `*` really is masked. If that cannot be made safe, masked columns are marked non-filterable in the probe (§6.3) and filtering on them returns 400 `invalid_filter`, while detail still does not reveal the masking (Q5). | P4 |
 | S4 | Does `AuthenticationService.authenticateBearer` return `Left` when the chain is empty? How is `exp` exposed? It is flattened as a `Date.toString` in `AuthenticatedProfile.claims`, not as epoch seconds. | `EdgeHandshake` **trusts the client** when no provider is configured (`edge/EdgeHandshake.scala:89`). The JWT and OIDC authenticators accept a token that has no `exp`. The REST edge must not inherit either behaviour. | P5 |
-| S5 | Does `MetadataFilterRewriter` narrow the exact `information_schema` queries of §6.2, with no row leaking from other attached catalogs? | Listings must show only readable objects. The admin REST catalog handlers (`ondemand/api/CatalogHandlers.scala:84,91`) do **not** filter per grant, so they must not be reused here. | P5 |
+| S5 | Does `MetadataFilterRewriter` narrow the exact `information_schema` queries of §6.2 **for each of the three kinds** (session catalog `<catalogAlias>` or `memory`), with no row leaking from other attached catalogs? | Listings must show only readable objects. The admin REST catalog handlers (`ondemand/api/CatalogHandlers.scala:84,91`) do **not** filter per grant, so they must not be reused here. | P5 |
 | S6 | Which Ember settings does http4s 0.23.24 (`project/Versions.scala:4`) provide: `withMaxHeaderSize`, `withRequestHeaderReceiveTimeout`, `withIdleTimeout`, `withMaxConnections`? Is the URI length bounded by the header limit? | Protection against slowloris and oversized requests (§7.1). | P5 |
-| S7 | Does the **fully qualified** `"<alias>"."<schema>"."<name>"` form confine every statement to the tenant catalog, with no resolution into built-in catalogs or system schemas? | §6.4 relies on the three-part form to confine every statement to the tenant catalog. `USE` only sets a default; it does not constrain resolution. | P4 |
+| S7 | Does the **fully qualified** `"<catalog>"."<schema>"."<name>"` form (§6.7) confine every statement to the tenant catalog, for each kind? That includes `memory`, whose session catalog *is* DuckDB's built-in `memory` catalog (`model/DuckDbCatalogs.scala:13`). Is there no resolution into any other built-in catalog or system schema? | §6.4 relies on the three-part form to confine every statement to the tenant catalog. `USE` only sets a default; it does not constrain resolution. | P4 |
 | S8 | What does a pathological LIKE pattern (4 KiB, many wildcards, with and without `ESCAPE`) cost on the pinned DuckDB, measured? | Node CPU is shared by the whole pool, and P-4 means no cancellation. The measurement sets the wildcard cap in §6.4. | P3 |
 
 ---
@@ -195,7 +198,8 @@ registry. The table in §10 depends on this ordering.
    `rest_access_denied`. Every one of these counts toward the throttle (§7.3).
 6. **Resolve the tenant-db and pool** from the in-memory registry. The pool is the `pool` parameter
    if given, otherwise `PoolPicks.readPoolKey` (`ondemand/api/PoolPicks.scala:26`).
-   - A tenant-db that is unknown, or outside the PAT `databases` axis, gets 404 `not_found`.
+   - A tenant-db that is unknown, outside the PAT `databases` axis, or a branch (`branchOf` set,
+     P-2) gets 404 `not_found`.
    - An unknown pool also gets 404 `not_found`.
 7. **Authorize**, before doing anything else. The edge calls
    `authorizeHandshake(tenant, pool, username, jwtRoles, jwtGroups, superuserAdmissible = false)`
@@ -352,7 +356,7 @@ Every endpoint is a `GET` under `/api/v1/tenant/{tenant}/database/{tenantDb}`.
 
 ### 6.3 `GET .../schemas/{schema}/tables/{table}` (detail) and the schema probe
 
-The **schema probe** is `SELECT * FROM "<alias>"."<schema>"."<table>" [AT (VERSION => n)] LIMIT 0`.
+The **schema probe** is `SELECT * FROM "<catalog>"."<schema>"."<table>" [AT (VERSION => n)] LIMIT 0`.
 It runs through `RoutedExecutor`, and its Arrow schema is the column contract **after policy**:
 
 - columns dropped by CLS are absent;
@@ -429,7 +433,7 @@ but never its value.
 **Rendering** (`RowsSql.render`, a pure function):
 
 ```
-SELECT <probed idents> FROM "<alias>"."<schema>"."<table>" AT (VERSION => <id>)
+SELECT <probed idents> FROM "<catalog>"."<schema>"."<table>" AT (VERSION => <id>)
  WHERE <p1> AND <p2> ...
  ORDER BY <terms>
  LIMIT <effectiveLimit + 1> OFFSET <offset>
@@ -440,8 +444,8 @@ SELECT <probed idents> FROM "<alias>"."<schema>"."<table>" AT (VERSION => <id>)
   - Identifiers come only from the probe and pass through `SqlLiterals.duckdbIdent`.
   - Values are rendered as `CAST(<duckdbLiteral> AS <probed type>)`. Numbers, booleans and dates
     are therefore rendered as quoted literals too.
-- **Catalog confinement.** Every name is **fully qualified** with the tenant-db alias
-  (`TenantDb.catalogAlias`).
+- **Catalog confinement.** Every name is **fully qualified** with the tenant-db's session catalog,
+  `<catalog>`. How that name is resolved depends on the kind (§6.7).
   - The router's `wrapWithDefaultSchema` (`edge/FlightSqlRouter.scala:864-895`) prefixes `USE`
     with the tenant-db's *default* schema, not the path schema.
   - `USE` sets a default. It does **not** stop name resolution from leaving the catalog, so the
@@ -453,7 +457,7 @@ SELECT <probed idents> FROM "<alias>"."<schema>"."<table>" AT (VERSION => <id>)
   - `neq` renders as `<>`.
   - `not.` wraps the predicate in `NOT (...)`.
 - **S3 outcome.** If S3 shows that `WHERE` sees raw values, the rendered shape becomes
-  `SELECT ... FROM (SELECT * FROM "<alias>"."<schema>"."<table>" AT (...)) AS q WHERE ... ORDER BY ... LIMIT ...`.
+  `SELECT ... FROM (SELECT * FROM "<catalog>"."<schema>"."<table>" AT (...)) AS q WHERE ... ORDER BY ... LIMIT ...`.
   S3 decides this once for all requests; it is never chosen per request.
 - **Limit.** `effectiveLimit = min(limit ?: defaultLimit, maxRows, pat.maxRows)`, computed by
   `ExecCaller.effectiveMaxRows` (`ondemand/api/ExecCaller.scala:25`). The query fetches
@@ -468,6 +472,8 @@ SELECT <probed idents> FROM "<alias>"."<schema>"."<table>" AT (VERSION => <id>)
 - Views follow the outcome of S2.
 
 ### 6.5 Response formats and headers
+
+(Section 6.7 gives the rules that differ per database kind.)
 
 The format is chosen from the `format` query parameter first, then from `Accept`, and falls back to
 JSON. An unsupported value gets 406 `unsupported_format`. `parquet` gets 406 until P-1 is resolved.
@@ -531,6 +537,48 @@ Header values are built only from integers and fixed strings, so no response spl
   to be deliberate.
 
 ---
+
+### 6.7 Database kinds
+
+v1 serves **every tenant-db kind QoD registers** (`model/TenantDbKind.scala`): `ducklake`,
+`duckdb-file` and `memory`. All three kinds share the endpoints, grammar, formats, authentication,
+policies and limits. The table below lists the only points where they differ, each checked against
+the code:
+
+| Aspect | `ducklake` | `duckdb-file` (incl. encrypted) | `memory` |
+|---|---|---|---|
+| Session catalog `<catalog>` | `TenantDb.catalogAlias(metastore)`: `catalogAlias`, else `dbName` | the same | **`memory`**. `catalogAlias` returns `""` here because the metastore is empty (`model/TenantDb.scala:80-85`), so calling it directly would render `""."s"."t"`. |
+| Default schema | `schemaName` | `schemaName` | `main` |
+| Snapshot / `AT (VERSION => n)` | always rendered; `X-QoD-Snapshot` sent | never; no header | never; no header |
+| `asOf`, `asOfTag`, `asOfTs` | served (`SnapshotSelector`) | 400 `time_travel_unsupported` | 400 `time_travel_unsupported` |
+| Consistency across pages | **guaranteed** by echoing the snapshot back as `asOf` | best-effort: rows committed between pages can shift them | best-effort. With several nodes, **each node holds its own in-memory data**, so which node the router picks decides what a page sees. This is the same on every door today. |
+| Encryption at rest | transparent (per-file keys in the DuckLake catalog) | transparent (the node attaches with `encryptionKey`) | n/a |
+| Branch tenant-dbs | 404 in v1 (P-2) | n/a | n/a |
+
+Rules that follow from this table:
+
+- **One resolver for the session catalog.** The router already maps a kind to its session catalog
+  and default schema inline (`perKindDb`/`perKindSchema`, `edge/FlightSqlRouter.scala:419-428`).
+  Extract that logic into one pure helper, for example `SessionCatalog.of(kindWire, metastore)` in
+  `model/`, and have both the router and the REST edge call it. The REST edge must **never** call
+  `TenantDb.catalogAlias` directly. If the two ever disagreed, the ACL would validate against one
+  catalog while the node executed against another.
+- **Confinement per kind.** The only catalog a REST statement may name is `<catalog>`. For `memory`
+  that is the built-in `memory` catalog itself, so S7 must prove that naming it does not open any
+  other built-in catalog.
+- **The probe and its data statement run on one node.** On DuckLake, the shared `AT` id makes them
+  consistent on any node. The other kinds have no such pin, and a `memory` pool's nodes can even
+  hold different tables. So the data statement is sent to the probe's node (`Routed.nodeId`),
+  through the router's existing `preferredNode` (`FlightSqlRouter.execute`), threaded through
+  `ExecCaller` (§8.1). If that node is no longer routable, the router falls back as usual, and a
+  schema that has since changed shows up as a 502 `upstream_error`, never as unvalidated SQL.
+- **Listing is kind-agnostic.** `MetadataFilterRewriter` keys its filter on the session catalog it
+  is given (`defaultDatabase`, `edge/meta/MetadataFilterRewriter.scala:225`), which the router
+  derives per kind. The `information_schema` templates in §6.2 filter on the same `<catalog>` value.
+  S5 covers all three kinds.
+- **Time-travel errors are uniform.** For a non-DuckLake tenant-db, `asOf*` returns
+  `time_travel_unsupported` only after authorization (§4 step 7). The kind is therefore never
+  revealed to a caller who cannot read the database.
 
 ## 7. Hardening for internet exposure
 
@@ -689,6 +737,8 @@ it. It is also the chokepoint that every non-FlightSQL caller shares. The change
    - `source: String = "flightsql"`, forwarded to `FlightSqlRouter.execute`. `execute` gains the
      same parameter and forwards it to `executeWith`, which today hard-codes `"flightsql"`
      (`edge/FlightSqlRouter.scala:356-368`). MCP call sites pass `"mcp"`.
+   - `preferredNode: Option[String] = None`, forwarded to `FlightSqlRouter.execute`'s existing
+     `preferredNode`. It pins the data statement to the probe's node (§6.7).
    - `preAuthorized: Option[EffectiveSet] = None`. The REST edge authorizes in §4 step 7 and hands
      the result over, so the executor skips its own `authorizeHandshake`. Attenuation by the
      restriction and the `pools`-axis check **still run** on it.
@@ -918,7 +968,8 @@ supervisor.
 | P1 | **S1.** In the text tier, `AT (VERSION => n)` on a three-part reference survives both the CLS and the RLS rewriter, and the policy is still applied. In the semantic tier, RLS filters the rows. CLS: a masked column carries the masked value, and a column dropped by CLS gives `unknown_column` whether it appears in `select`, `order` or a filter. |
 | P2 | **S3, the masked-column oracle.** Use a mask that **keeps partial information** (`left(ssn,3)||'***'`), and data whose raw ordering and raw `LIKE` matches differ from the masked ones. Then `like`, `gt`, `is.null` and `order` on the masked column must produce exactly what the same operations produce over the masked values, or the request must get 400. With a constant mask the test would pass trivially, so this data is required. The test is written **before** S3 is resolved: it starts red and forces the decision. |
 | P4 | **S5.** Listings return only granted schemas and tables. A view is reported as `view`. An attached federated catalog is never listed. |
-| P8 | **S7.** The rendered three-part name stays inside the tenant catalog, even for a principal holding a schema-wide `*` grant. |
+| P8 | **S7.** The rendered three-part name stays inside the tenant catalog, for each kind (including `memory`), even for a principal holding a schema-wide `*` grant. |
+| P9 | **Session-catalog parity.** For every kind and metastore shape (`catalogAlias` set, only `dbName`, empty for `memory`), the router's `ValidationContext.defaultDatabase` equals the REST `<catalog>`. Both come from `SessionCatalog.of`, and this test keeps them from drifting apart. |
 
 ### 11.5 End-to-end (E): real node and real DuckLake
 
@@ -937,6 +988,7 @@ on:
 | E4 | With `pat.maxRows` smaller than `maxRows` smaller than `limit`, the smallest cap wins, and `X-QoD-Truncated` is set. |
 | E5 | History and metrics: the history row has `source='rest'` and the `pat_id`. `statements_total{source="rest"}` goes up. |
 | E6 | **Hibernation, split so each case is deterministic.** (a) A suspended pool whose node becomes routable within the hold: 200. (b) A hold that expires: 503 `pool_resuming` with `Retry-After`. (c) An unauthorized request leaves the pool suspended. |
+| E8 | **Every kind.** E1 and the listing endpoints run against a `ducklake`, an encrypted `duckdb-file` and a `memory` tenant-db. On the two non-DuckLake kinds, `asOf` gives `time_travel_unsupported`, and there is no `AT` and no `X-QoD-Snapshot`. The `memory` statement is qualified `"memory"."main"."t"`. The probe and data statement land on the same node (captured `nodeId`). A branch tenant-db addressed by its name gets 404. |
 | E7 | **S8 measurement.** Time the worst-case pattern allowed by the wildcard cap, and record it in §2.4. |
 
 ### 11.6 Cross-surface and regression
@@ -971,8 +1023,8 @@ green, and starts only once its gate is closed.
 | **P1** | §8.1: extract `RoutedExecutor`; typed `systemCaller`; reserve internal identity names; thread `source`, `preAuthorized` and `superuserAdmissible`; close late results; history column and metrics tag. PAT `last_used_at` throttling (§5.2). Tests: R1 to R5, 11.6. | none. Independent of the decisions, and useful even without REST. |
 | **P2** | PAT `restAccess`: Liquibase, `TokenRestriction` plus `SessionRoot`, `PatStore`, the REST DTO, MCP, CLI, UI, and regenerating `openapi.yaml`. Tests: U7, CLI parity. | Q2 confirmed (P-3) |
 | **P3** | Pure core: `RowsQuery`, `RowsSql`, `RestResultEncoder`, format negotiation. Tests: U1 to U5, U11. | S8 for the wildcard cap. The S3 shape switch lands in P4. |
-| **P4** | Integration of snapshot, probe and render. Tests: P1, P2, P4, P8. | S1, S2, S3, S7 |
-| **P5** | Server shell: `RestEdgeConfig` and its validation, `RestEdgeServer`, `RestAuth`, `AuthThrottle`, `ClientAddress`, `UserLimiter`, the endpoints, OpenAPI, wiring, shutdown and banner. Tests: U6, U8 to U10, H1 to H17, E1 to E7. | S4, S5, S6. Q1, Q3 and Q4 confirmed. |
+| **P4** | Integration of snapshot, probe and render, plus the `SessionCatalog.of` extraction and the probe-node pin (§6.7). Tests: P1, P2, P4, P8, P9. | S1, S2, S3, S7 |
+| **P5** | Server shell: `RestEdgeConfig` and its validation, `RestEdgeServer`, `RestAuth`, `AuthThrottle`, `ClientAddress`, `UserLimiter`, the endpoints, OpenAPI, wiring, shutdown and banner. Tests: U6, U8 to U10, H1 to H17, E1 to E8. | S4, S5, S6. Q1, Q3 and Q4 confirmed. |
 | **P6** | Deployment and documentation: Dockerfile, compose, Helm. README: ports, a new section, the architecture diagram, the config table. CLAUDE.md: four sockets become five. CHANGELOG: a 0.9.5 heading and entry. Operator skill plus its bundled copy, including the deployment guidance from §7.1 and §7.3 (WAF, `trustedProxies`, NAT collateral) and P-9's IdP note. | P5 |
 
 ---
