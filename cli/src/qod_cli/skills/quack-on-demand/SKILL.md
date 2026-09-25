@@ -576,6 +576,19 @@ never the rest of the schema. This is what makes a JDBC/ADBC client's table tree
 those catalog RPCs are `information_schema` queries underneath and used to come back
 denied.
 
+The same filter covers DuckDB's own catalog functions `duckdb_tables()`,
+`duckdb_views()`, `duckdb_schemas()` and `duckdb_columns()`: called unqualified and
+without arguments in a read-only statement, each is narrowed to the session database and
+the principal's granted objects (a grantless principal gets zero rows, not a denial).
+This is what makes a native `ATTACH 'quack:...' (TYPE quack, TOKEN '...')` work for an
+ordinary user: the DuckDB client syncs the remote catalog with
+`duckdb_tables() UNION ALL duckdb_views()` on attach, and before 0.9.5 that sync was
+denied for anyone without a `*.*.*` ALL grant (`unsupported constructs (deny,
+fail-closed): table function duckdb_tables`). The attached catalog then lists only the
+tables the user is granted; an ungranted table is simply absent (`does not exist` on
+the client), never described. Other table functions (`read_parquet`, ...) are unchanged
+and stay denied without a wildcard ALL grant.
+
 An **explicit** `information_schema` grant is still meaningful: it is the escape hatch
 that turns the filter off for that principal and restores the unfiltered read (useful
 for a tooling or admin account that must see the whole catalog):
@@ -594,11 +607,19 @@ whole feature off manager-wide and go back to the pre-0.6.7 grant-required postu
 
 **Denial semantics** (all fail-closed, and all only when ACL is on):
 
-- The filter rewrites `information_schema` references it finds in `FROM` position. A
-  reference sitting in `ORDER BY`, `GROUP BY` or a window clause, or a filterable name
-  merely **mentioned inside a string literal**, is *denied* with a message ending
-  `query it directly in the FROM clause instead`. The remedy is to move the reference
-  into the `FROM` clause (or drop the literal mention) and re-run.
+- The filter rewrites `information_schema` references and `duckdb_*()` catalog calls it
+  finds in `FROM` position. A reference sitting in `ORDER BY`, `GROUP BY` or a window
+  clause, or a filterable name merely **mentioned inside a string literal**, is *denied*
+  with a message ending `query it directly in the FROM clause instead`. The remedy is to
+  move the reference into the `FROM` clause (or drop the literal mention) and re-run.
+- A bare reference to one of DuckDB's system views (`FROM sqlite_master`, `FROM pg_class`,
+  `FROM duckdb_databases`, `FROM duckdb_tables` without parentheses, and the other default
+  views of `system.main` / `system.pg_catalog`, also spelled `main.X` or `system.main.X`)
+  is denied for every non-wildcard principal, flag on or off: on the node such a name
+  resolves to the system view unless a real table shadows it, and the manager cannot tell
+  which. For the catalog functions, call them as `duckdb_tables()` and they are filtered;
+  qualified (`main.duckdb_tables()`) and argument-carrying calls are denied the same way.
+  A real table that happens to carry such a name is reachable by its three-part name.
 - `DESCRIBE <t>`, `SHOW <t>` and `SHOW COLUMNS FROM <t>` now require RO on the target
   table. They previously bypassed the ACL entirely. This applies whenever ACL is on,
   independent of `QOD_ACL_FILTERED_METADATA`.

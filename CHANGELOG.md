@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.9.6
+
+- **`ATTACH ... (TYPE quack)` now works for users holding column policies, and their masks hold on
+  the pushed-down scans (#114, second report).** Two gaps behind one symptom. First, the column-level
+  security rewriter runs the attach-time catalog sync (`duckdb_tables() UNION ALL duckdb_views()`)
+  through its column resolver, which cannot model a table function and reported a parse failure,
+  denied fail-closed: `column policy rewrite could not parse statement`. A statement that reads no
+  physical table, only the four filterable catalog functions, now passes that rewriter (decided on
+  the ACL parser's complete walk, so a policy-bearing table hidden in any subquery still reaches the
+  resolver; batches and other table functions keep the fail-closed path). Second, and worse once the
+  first was fixed: the quack client pushes every scan down as `SELECT #1, #2 FROM <table>`, DuckDB
+  positional references with no column names, so the resolver saw nothing to mask and forwarded the
+  scan unmasked. Positional references are now resolved against the table's physical column order
+  before the mask runs, for the one shape whose numbering is unambiguous (a single-table SELECT with
+  no join, subquery or set operation, `#n` in the projection, WHERE or an expression); a `#n` as an
+  ORDER BY, GROUP BY or HAVING term, in a join or derived table, out of range, or on a table the
+  catalog does not know is denied rather than guessed. `QuackCompatibilitySpec` attaches with a
+  column mask and a row policy in force and asserts the masked value on a pushed-down scan.
+
+- **Bare references to DuckDB's system views no longer pass a schema-wide grant.** DuckDB keeps
+  default views in the `system` catalog's `main` and `pg_catalog` schemas, both on the unqualified
+  search path, so `FROM sqlite_master` (every catalog's DDL), `FROM pg_class` / `FROM pg_attribute`
+  (every catalog's relation and column names), `FROM duckdb_databases` (every attached catalog and
+  its path) and the rest resolve on a node whenever no table of that name shadows them. The ACL
+  parser qualified such a name as `<session>.<schema>.<name>` and grant-checked that, so a
+  `acme.*.* RO` grant admitted an unfiltered read of the system view. All 36 default views of DuckDB
+  1.5.5, plus any `duckdb_` / `pragma_` / `sqlite_` prefixed bare name, are now marked unsupported
+  (denied without a wildcard ALL grant, flag on or off), completing the `duckdb_tables` case of
+  0.9.5. A three-part name under a real catalog, and an explicit `pg_catalog.X` (the documented,
+  schema-grant-gated surface), are unchanged. `DuckDbSystemViewsSpec` pins the list against the
+  `duckdb` CLI so a DuckDB bump that adds a view fails the build.
+
+## 0.9.5
+
+- **Native `ATTACH ... (TYPE quack)` now works for ordinary users (#114).** The DuckDB quack
+  client syncs the remote catalog on attach with `duckdb_tables() UNION ALL duckdb_views()`, and the
+  ACL gate denied that query for every principal without a `*.*.*` ALL grant (`unsupported
+  constructs (deny, fail-closed): table function duckdb_tables`), so only superusers could attach.
+  The filtered-metadata rewriter now covers DuckDB's four catalog functions (`duckdb_tables()`,
+  `duckdb_views()`, `duckdb_schemas()`, `duckdb_columns()`) the way it covers `information_schema`:
+  an unqualified, argument-free call in a read-only statement is narrowed to the session catalog
+  (`database_name = '<session>'`) and the principal's Read-covering grants, under the same
+  `QOD_ACL_FILTERED_METADATA` flag. An attached catalog therefore lists only the tables the user is
+  granted; an ungranted table is absent on the client rather than described. Fail-closed as before:
+  calls with arguments, qualified calls (`main.duckdb_tables()`), `ROWS FROM`, positions the
+  rewriter cannot reach, and a catalog function riding inside a write or DDL statement are denied.
+  Also closed while here: the bare spelling `FROM duckdb_tables` (no parentheses), which DuckDB
+  resolves to the same function, used to be qualified as an ordinary table and admitted under any
+  schema-wide grant, exposing the DDL of every catalog on the node. The ACL parser now marks the
+  unqualified, `main.` and `system.main.` spellings unsupported (denied without wildcard ALL, flag on
+  or off). `QuackCompatibilitySpec` drives the real DuckDB CLI through the real
+  `PostgresAclValidator` with narrow grants instead of a stand-in that admitted everything, and
+  `QuackClientSyncFunctionsSpec` pins the vendored client's sync queries to the filterable set, so a
+  client bump that syncs through an unlisted function fails the build instead of re-opening #114.
+
 ## 0.9.4
 
 - **External Iceberg REST catalogs as a typed federated source.** A tenant-db can now attach an

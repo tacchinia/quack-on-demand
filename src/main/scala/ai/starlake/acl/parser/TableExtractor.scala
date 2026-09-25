@@ -26,6 +26,127 @@ final case class TableExtraction(tables: List[Table], unsupported: List[String])
   */
 object TableExtractor:
 
+  /** DuckDB's catalog-introspection table functions the edge metadata filter narrows to the session
+    * catalog and the principal's grants (issue #114). The single list both the walk below and
+    * `ai.starlake.quack.edge.meta.MetadataFilterRewriter` key off, so the admit and the filter
+    * cannot drift apart. Each also has a same-named default view in `system.main`, so its bare
+    * spelling falls under [[DuckDbDefaultViews]].
+    */
+  val DuckDbCatalogFunctions: Set[String] =
+    Set("duckdb_tables", "duckdb_views", "duckdb_schemas", "duckdb_columns")
+
+  /** The default views DuckDB creates in the `system` catalog's `main` and `pg_catalog` schemas
+    * (DuckDB 1.5.5, `src/catalog/default/default_views.cpp`). Both schemas sit on the unqualified
+    * search path, so `FROM sqlite_master`, `FROM pg_class` or `FROM duckdb_databases` (also spelled
+    * `main.X` / `system.main.X`) resolves to the system view whenever no table of that name shadows
+    * it, and several of them list every attached catalog's DDL, relation or column names. The ACL
+    * parser used to qualify such a name as `<session>.<schema>.X` and grant-check THAT, so a
+    * schema-wide grant admitted an unfiltered dump. `information_schema` views are NOT on that path
+    * (`FROM tables` fails on the node) and are handled as ordinary schema-qualified refs.
+    *
+    * `DuckDbSystemViewsSpec` pins this list against the `duckdb` CLI on PATH, so a DuckDB bump that
+    * adds a view fails locally and on the iceberg channel; [[BareSystemViewPrefixes]] is the
+    * backstop for a manager built before such a bump.
+    */
+  val DuckDbDefaultViews: Set[String] = Set(
+    // system.main
+    "duckdb_columns",
+    "duckdb_constraints",
+    "duckdb_databases",
+    "duckdb_indexes",
+    "duckdb_logs",
+    "duckdb_schemas",
+    "duckdb_tables",
+    "duckdb_types",
+    "duckdb_views",
+    "pragma_database_list",
+    "sqlite_master",
+    "sqlite_schema",
+    "sqlite_temp_master",
+    "sqlite_temp_schema",
+    // system.pg_catalog
+    "pg_am",
+    "pg_attrdef",
+    "pg_attribute",
+    "pg_class",
+    "pg_collation",
+    "pg_constraint",
+    "pg_database",
+    "pg_depend",
+    "pg_description",
+    "pg_enum",
+    "pg_index",
+    "pg_indexes",
+    "pg_namespace",
+    "pg_prepared_statements",
+    "pg_proc",
+    "pg_sequence",
+    "pg_sequences",
+    "pg_settings",
+    "pg_tables",
+    "pg_tablespace",
+    "pg_type",
+    "pg_views"
+  )
+
+  /** Name prefixes DuckDB reserves for its own introspection views. Deliberately NOT `pg_`: that
+    * prefix is common for real user tables, so pg_catalog views are covered by the exact list only.
+    */
+  val BareSystemViewPrefixes: Set[String] = Set("duckdb_", "pragma_", "sqlite_")
+
+  /** True when a bare (unqualified, `main.`- or `system`-qualified) table name resolves on the node
+    * to one of DuckDB's default views rather than to a grantable table.
+    */
+  def isBareSystemView(name: String): Boolean =
+    val n = Option(name).map(_.trim.stripPrefix("\"").stripSuffix("\"").toLowerCase(Locale.ROOT))
+    n.exists(x => DuckDbDefaultViews.contains(x) || BareSystemViewPrefixes.exists(x.startsWith))
+
+  /** Some(canonical name) when `raw` (a function or table name as the parser spells it, quotes
+    * included) is exactly one of [[DuckDbCatalogFunctions]], unqualified. A qualified spelling
+    * (`main.duckdb_tables`) is None: the filter only rewrites the unqualified call.
+    */
+  def catalogFunctionName(raw: String): Option[String] =
+    Option(raw)
+      .map(_.trim.stripPrefix("\"").stripSuffix("\"").toLowerCase(Locale.ROOT))
+      .filter(DuckDbCatalogFunctions.contains)
+
+  /** Some(canonical name) when `call` is exactly the argument-free call `name()` of one of
+    * [[DuckDbCatalogFunctions]] (quotes tolerated): the one shape the metadata filter rewrites.
+    * `duckdb_tables('x')`, `main.duckdb_tables()` and a bare `duckdb_tables` are None.
+    */
+  def catalogFunctionCall(call: String): Option[String] =
+    Option(call)
+      .map(_.trim)
+      .filter(_.endsWith("()"))
+      .flatMap(c => catalogFunctionName(c.dropRight(2)))
+
+  private val TableFunctionMarkerPrefix = "table function "
+
+  /** The `unsupported` marker for a table function, carrying the call as the parser prints it
+    * (`read_parquet('/x')`, `duckdb_tables()`), in one place so the validator can read it back with
+    * [[tableFunctionName]] instead of matching on prose.
+    */
+  def tableFunctionMarker(call: String): String = TableFunctionMarkerPrefix + call
+
+  /** Inverse of [[tableFunctionMarker]]: Some(call) for a marker it produced, None otherwise. */
+  def tableFunctionName(marker: String): Option[String] =
+    Option.when(marker.startsWith(TableFunctionMarkerPrefix))(
+      marker.drop(TableFunctionMarkerPrefix.length)
+    )
+
+  /** The marker for a DuckDB default view referenced by a bare table name. Deliberately NOT a
+    * [[tableFunctionMarker]]: the manager cannot tell whether a real table of that name shadows the
+    * system view on the node, so this spelling is never admitted (only wildcard ALL and superusers,
+    * who bypass the whole gate, can use it). The four filterable catalog functions get the
+    * actionable hint; the rest have no grantable object behind them at all.
+    */
+  def bareSystemViewMarker(name: String): String =
+    if catalogFunctionName(name).isDefined then
+      s"catalog function $name referenced without parentheses (call it as $name())"
+    else
+      s"DuckDB system view $name referenced by its bare name (no grantable table behind it; " +
+        "qualify a real table with its catalog)"
+
   /** Extract all Table references from a parsed Select statement.
     *
     * @param select
@@ -196,18 +317,39 @@ private[parser] class TableExtractorVisitor:
             (table.getDatabase != null && table.getDatabase.getDatabaseName != null)
           val isCteName = !isQualified && cteNames.contains(name.toLowerCase(Locale.ROOT))
           val isFileRef = table.getName != null && table.getName.startsWith("'")
+          // `FROM sqlite_master`, `FROM pg_class`, `FROM duckdb_tables`: DuckDB resolves a bare
+          // name to its default view in system.main / system.pg_catalog unless a table shadows
+          // it, for the unqualified, `main`-qualified and `system`-qualified spellings.
+          // Qualifying it as `<session>.<schema>.<name>` and grant-checking THAT would admit a
+          // schema-wide grant to an unfiltered dump of every catalog's DDL, so it is not a table
+          // ref (TableExtractor.DuckDbDefaultViews). A three-part name under a real catalog
+          // resolves to a table (or errors) on the node and stays an ordinary, grant-gated
+          // reference; so does an explicit `pg_catalog.X` (any schema other than `main`), the
+          // documented grant-gated surface.
+          val catalog         = Option(table.getUnquotedDatabaseName).filter(_.nonEmpty)
+          val schema          = Option(table.getUnquotedSchemaName).filter(_.nonEmpty)
+          val isBareCatalogFn = !isCteName &&
+            TableExtractor.isBareSystemView(name) &&
+            catalog.forall(_.equalsIgnoreCase("system")) &&
+            schema.forall(_.equalsIgnoreCase("main"))
           if isFileRef then
             // DuckDB `FROM 'file.parquet'` reads straight from storage, escaping
             // the tenant-catalog boundary; there is no table to grant on.
             unsupported += s"file reference ${table.getName}"
+          else if isBareCatalogFn then
+            unsupported += TableExtractor.bareSystemViewMarker(name.toLowerCase(Locale.ROOT))
           else if !isCteName then tables += table
       case ls: LateralSubSelect  => visitParenthesedSelect(ls)
       case ps: ParenthesedSelect => visitParenthesedSelect(ps)
       case tf: TableFunction     =>
         // Table functions (read_parquet, read_csv, ...) can read files directly,
-        // escaping the tenant-catalog boundary; no grantable table ref exists.
-        val fnName = Option(tf.getFunction).map(_.getName).getOrElse("?")
-        unsupported += s"table function $fnName"
+        // escaping the tenant-catalog boundary; no grantable table ref exists. The
+        // marker carries the whole call (name AND arguments) so the validator can
+        // admit exactly the argument-free DuckDB catalog calls under the
+        // filtered-metadata flag (TableExtractor.catalogFunctionCall reads it back);
+        // a ROWS FROM list has no single function and prints as itself.
+        val call = Option(tf.getFunction).map(_.toString).getOrElse(tf.toString)
+        unsupported += TableExtractor.tableFunctionMarker(call)
       case pfi: ParenthesedFromItem =>
         // `FROM (a JOIN b ON ...)`: recurse into the wrapped item and its joins.
         val inner = pfi.getFromItem
