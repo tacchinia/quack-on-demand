@@ -201,6 +201,11 @@ precedent of `ColumnPolicyRewriterSpec`); no production code was changed by the 
   policy cannot read at a snapshot. Without the clause both policies apply. Fix in the rewriters
   (strip and re-attach the clause, as the ACL parser and the metadata filter already do) before
   the edge sends `AT`. `RestTimeTravelPolicySpec`.
+  **Fixed** by `edge/policy/TimeTravelCarrier`: both rewriters now strip the clause with the ACL
+  scanner and re-attach it to the same base table after rewriting, failing closed when it cannot.
+  Residual, outside the edge: `MetadataFilterRewriter` drops the pin when it substitutes an
+  `information_schema` reference in a statement that also pins a table (current data is read;
+  nothing leaks). The edge never mixes the two.
 - **S2: BLOCKED on this machine** (the `ducklake` extension cannot be downloaded). The test
   cancels here; when it runs it fails only if `AT` on a view is accepted but ignored.
   `RestViewTimeTravelSpec`.
