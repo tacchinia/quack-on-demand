@@ -213,7 +213,9 @@ precedent of `ColumnPolicyRewriterSpec`); no production code was changed by the 
   `ESCAPE`, grow as length^(wildcards-1): with 4 wildcards one 4 KiB value costs about 35 s. Two
   wildcards cost about 25 ms at 4 KiB, and `lower(col) LIKE lower(p)` stays linear. Consequence for
   §6.3: render `ilike` as `lower(col) LIKE lower(pattern)`, and allow at most 2 wildcards whenever
-  the pattern needs `ESCAPE`. `RestLikePatternCostSpec`.
+  the pattern needs `ESCAPE`. `RestLikePatternCostSpec`. Superseded by the §6.3 rule: two inner
+  wildcards under `ESCAPE` with long segments still cost 3.9 s on a 4 KiB value, so `ESCAPE` is
+  never emitted.
 
 ---
 
@@ -453,11 +455,21 @@ limit    := [1-9][0-9]{0,9} (<= 2^31-1)       offset := "0" | [1-9][0-9]{0,9} (<
 - **Operators and column types:**
   - `like` and `ilike` apply to string columns only.
   - Nested, blob and interval columns can be selected, but not filtered or ordered.
-- **LIKE patterns:**
-  - `*` maps to `%`.
-  - A literal `%`, `_` or `\` is escaped, and `ESCAPE '\'` is emitted only when something was
-    escaped.
-  - At most 4 wildcards per pattern (subject to S8).
+- **LIKE patterns** (S8: every admitted pattern stays on a linear matcher; `ILIKE`, `_` and
+  `ESCAPE` would put DuckDB on its backtracking one, seconds per 4 KiB value):
+  - `*` is the only wildcard, at most 4 per pattern. `\` is an ordinary character: DuckDB's LIKE
+    has no default escape.
+  - Without a literal `%` or `_`, the value is a LIKE pattern with `*` mapped to `%`:
+    `<col> LIKE CAST('<pattern>' AS VARCHAR)`.
+  - With a literal `%` or `_`, `*` may only start or end the value; any inner `*` gets
+    `invalid_filter`. The value without its edge `*`s is a needle, rendered as `<col> = <needle>`
+    (no `*`), `starts_with(<col>, <needle>)` (`x*`), `ends_with(<col>, <needle>)` (`*x`) or
+    `contains(<col>, <needle>)` (`*x*`), the needle as `CAST('<needle>' AS VARCHAR)`.
+  - `ilike` renders the same forms over `lower(<col>)` and `lower(CAST(... AS VARCHAR))`, never
+    `ILIKE`. On DuckDB 1.5.4 this equals ILIKE for ASCII and for every BMP character checked;
+    neither does full case folding (`ß` does not match `ss`).
+  - `ESCAPE` is never emitted. The worst admitted pattern costs about 1 ms on a 4 KiB value
+    (`RestLikePatternCostSpec`).
 - **Paging and snapshots:**
   - `offset > 0` without `order` gets `order_required`.
   - More than one of the `asOf*` parameters gets `invalid_selector`.
@@ -806,7 +818,7 @@ the discovery spec required by constraint 2.
 
 **U3: golden SQL.**
 
-- The operator matrix, and LIKE escaping (with `ESCAPE` only when needed).
+- The operator matrix, and the LIKE forms of §6.3 (never `ILIKE`, never `ESCAPE`).
 - The three-part name for each kind (`"memory"."main"."t"` for `memory`).
 - `AT` present and absent, and `LIMIT n+1 OFFSET`.
 - **Never** an ordinal in `ORDER BY`, and never `*` in the data statement.
