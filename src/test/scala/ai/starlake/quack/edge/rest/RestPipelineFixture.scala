@@ -73,7 +73,8 @@ object RestPipelineFixture:
   final class Harness(
       val router: FlightSqlRouter,
       val poolKey: PoolKey,
-      captured: () => Option[String]
+      captured: () => Option[String],
+      val sup: PoolSupervisor
   ):
     /** Run `sql` through the whole pipeline; Right(sent SQL) or the router's refusal. */
     def run(sql: String, eff: EffectiveSet): Either[RouterFailure, String] =
@@ -98,7 +99,9 @@ object RestPipelineFixture:
       kc: KindCase,
       columnCatalog: ColumnCatalog = new ColumnCatalog.MapCatalog(Map.empty),
       validator: StatementValidator = StatementValidator.allowAll,
-      metadataFilter: MetadataFilterRewriter = new MetadataFilterRewriter(enabled = false)
+      metadataFilter: MetadataFilterRewriter = new MetadataFilterRewriter(enabled = false),
+      /** What the node answers to the statement it received; by default one row of `SELECT 1`. */
+      respond: String => QuackResponse = _ => TestArrow.okResponse()
   ): Harness =
     val backend = new QuackBackend:
       private val n          = TrieMap.empty[String, RunningNode]
@@ -158,7 +161,7 @@ object RestPipelineFixture:
     ):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
         last = Some(sql)
-        IO.pure(TestArrow.okResponse())
+        IO(respond(sql))
     val router = new FlightSqlRouter(
       sup,
       new SessionRegistry,
@@ -168,7 +171,7 @@ object RestPipelineFixture:
       columnPolicyRewriter = new ColumnPolicyRewriter(columnCatalog, enabled = true),
       metadataFilterRewriter = metadataFilter
     )
-    new Harness(router, key, () => last)
+    new Harness(router, key, () => last, sup)
 
   // ---- in-process DuckDB (core only) ----
 
