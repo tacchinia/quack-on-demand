@@ -45,6 +45,26 @@ object Banner:
              |$Line""".stripMargin
         )
 
+  private def display(h: String) = if h == "0.0.0.0" || h == "::" then "localhost" else h
+
+  /** The REST data edge's banner line (REST edge design, spec 2026-09-25 §8.3, Q4), without the
+    * banner's indent. With the ACL disabled the same line carries the warning instead of the auth
+    * note: the edge still boots (a warning, not a refusal), but every PAT of a tenant can then read
+    * every table of that tenant.
+    */
+  def restLine(host: String, port: Int, tls: Boolean, aclEnabled: Boolean): String =
+    val url  = s"${if tls then "https" else "http"}://${display(host)}:$port/api/v1"
+    val note =
+      if aclEnabled then "PAT bearer, read-only"
+      else "ACL DISABLED: any PAT of the tenant can read every table"
+    s"REST (data)   : $url  ($note)"
+
+  /** The boot WARN Main logs next to BootFactories' "SQL ACL disabled" warning: the REST line when
+    * the edge is on and the ACL is off, nothing otherwise.
+    */
+  def restAclWarning(rest: Option[(String, Int, Boolean)], aclEnabled: Boolean): Option[String] =
+    rest.filterNot(_ => aclEnabled).map((h, p, tls) => restLine(h, p, tls, aclEnabled))
+
   /** The post-startup banner: printed once REST and FlightSQL are both listening. `restHost` /
     * `flightHost` of 0.0.0.0 render as localhost so the strings are copy-pasteable.
     */
@@ -57,19 +77,23 @@ object Banner:
       tlsEnabled: Boolean,
       /** The native Quack front door `(host, port, tls)` when it is enabled. */
       quack: Option[(String, Int, Boolean)] = None,
+      /** The REST data edge `(host, port, tls)` when it is enabled. */
+      rest: Option[(String, Int, Boolean)] = None,
       /** Whether the SQL ACL (`quack-flightsql.acl.enabled`, env `QOD_ACL_ENABLED`) is enforced.
         * Required, not defaulted: the logger's ACL line sits below the default ERROR level, so this
         * banner is the one place an operator reliably sees whether grants are enforced.
         */
       aclEnabled: Boolean
   ): String =
-    def display(h: String) = if h == "0.0.0.0" || h == "::" then "localhost" else h
-    val aclLine            =
+    val aclLine =
       if aclEnabled then "   SQL ACL       : ENABLED (grants, column and row policies enforced)"
       else
         "   SQL ACL       : DISABLED (every statement admitted; set QOD_ACL_ENABLED=true to enforce)"
-    val rh        = display(restHost)
-    val fh        = display(flightHost)
+    val rh             = display(restHost)
+    val fh             = display(flightHost)
+    val restBannerLine = rest.fold("") { case (h, p, tls) =>
+      s"\n   ${restLine(h, p, tls, aclEnabled)}"
+    }
     val quackLine = quack.fold("") { case (h, p, tls) =>
       s"\n   Quack (DuckDB): quack:${display(h)}:$p  (${if tls then "TLS" else "plain HTTP"})"
     }
@@ -92,7 +116,7 @@ object Banner:
        | Quack on Demand $version is up
        |   control plane : ${jdbcControlPlaneUrl(meta)}
        |   REST API + UI : http://$rh:$restPort  (UI: http://$rh:$restPort/ui)
-       |   FlightSQL     : $scheme://$fh:$flightPort$quackLine
+       |   FlightSQL     : $scheme://$fh:$flightPort$quackLine$restBannerLine
        |$aclLine
        |
        | Client connection strings (replace <tenant>, <pool>, <user>):$quackStrings

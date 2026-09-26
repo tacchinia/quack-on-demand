@@ -102,6 +102,7 @@ object Main extends IOApp with LazyLogging:
   given ProductHint[ManagerConfig]             = ProductHint[ManagerConfig](camelMapping)
   given ProductHint[FlightConfig]              = ProductHint[FlightConfig](camelMapping)
   given ProductHint[QuackNativeConfig]         = ProductHint[QuackNativeConfig](camelMapping)
+  given ProductHint[RestEdgeConfig]            = ProductHint[RestEdgeConfig](camelMapping)
   given ProductHint[DatabaseAuthConfig]        = ProductHint[DatabaseAuthConfig](camelMapping)
   given ProductHint[KeycloakAuthConfig]        = ProductHint[KeycloakAuthConfig](camelMapping)
   given ProductHint[GoogleAuthConfig]          = ProductHint[GoogleAuthConfig](camelMapping)
@@ -132,6 +133,7 @@ object Main extends IOApp with LazyLogging:
   given ConfigReader[ManagerConfig]            = deriveReader[ManagerConfig]
   given ConfigReader[FlightConfig]             = deriveReader[FlightConfig]
   given ConfigReader[QuackNativeConfig]        = deriveReader[QuackNativeConfig]
+  given ConfigReader[RestEdgeConfig]           = deriveReader[RestEdgeConfig]
   given ConfigReader[DatabaseAuthConfig]       = deriveReader[DatabaseAuthConfig]
   given ConfigReader[KeycloakAuthConfig]       = deriveReader[KeycloakAuthConfig]
   given ConfigReader[GoogleAuthConfig]         = deriveReader[GoogleAuthConfig]

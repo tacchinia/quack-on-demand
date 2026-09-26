@@ -977,3 +977,107 @@ final case class QuackNativeConfig(
     )
     maxBodyBytes: Long
 )
+
+/** The read-only REST data edge (`quack-rest` block): `GET /api/v1/...` over PAT bearer auth on its
+  * own port, translating one request into one SELECT through the routed executor. See
+  * docs/superpowers/specs/2026-09-25-quack-rest-data-edge-design.md (§8.2).
+  */
+final case class RestEdgeConfig(
+    @field @ConfigField(
+      envVar = "QOD_REST_ENABLED",
+      description = "Serve the read-only REST data edge (PAT bearer, GET only)."
+    )
+    enabled: Boolean,
+    @field @ConfigField(envVar = "QOD_REST_HOST", description = "REST data edge bind address.")
+    host: String,
+    @field @ConfigField(envVar = "QOD_REST_PORT", description = "REST data edge port.")
+    port: Int,
+    @field @ConfigField(
+      envVar = "QOD_REST_TLS_ENABLED",
+      description =
+        "Enable TLS on the REST data edge. On by default: PAT bearers must not cross the network in clear text."
+    )
+    tlsEnabled: Boolean,
+    @field @ConfigField(
+      envVar = "QOD_REST_TLS_CERT_CHAIN",
+      description =
+        "Path to the TLS certificate chain PEM (shared with the FlightSQL edge by default)."
+    )
+    tlsCertChain: String,
+    @field @ConfigField(
+      envVar = "QOD_REST_TLS_PRIVATE_KEY",
+      description = "Path to the TLS private key PEM (PKCS8)."
+    )
+    tlsPrivateKey: String,
+    @field @ConfigField(
+      envVar = "QOD_REST_DEFAULT_LIMIT",
+      description = "Rows returned by /rows when the request gives no limit."
+    )
+    defaultLimit: Int,
+    @field @ConfigField(
+      envVar = "QOD_REST_MAX_ROWS",
+      description =
+        "Server row cap for /rows and the listings; a request limit or a token's maxRows can only lower it."
+    )
+    maxRows: Int,
+    @field @ConfigField(
+      envVar = "QOD_REST_STMT_TIMEOUT_SEC",
+      description =
+        "Bounded wait per statement, in seconds (a token's stmtTimeoutMs can only lower it); past it the edge answers 504."
+    )
+    stmtTimeoutSec: Int,
+    @field @ConfigField(
+      envVar = "QOD_REST_MAX_CONNECTIONS",
+      description = "Maximum concurrent client connections on the REST data edge."
+    )
+    maxConnections: Int,
+    @field @ConfigField(
+      envVar = "QOD_REST_MAX_HEADER_BYTES",
+      description = "Largest request head accepted (request line plus headers), in bytes."
+    )
+    maxHeaderBytes: Int,
+    @field @ConfigField(
+      envVar = "QOD_REST_HEADER_RECEIVE_TIMEOUT_SEC",
+      description = "Seconds a client has to send its request headers before the connection closes."
+    )
+    headerReceiveTimeoutSec: Int,
+    @field @ConfigField(
+      envVar = "QOD_REST_IDLE_TIMEOUT_SEC",
+      description = "Seconds an idle keep-alive connection stays open."
+    )
+    idleTimeoutSec: Int
+)
+
+object RestEdgeConfig:
+
+  /** Boot validation (§8.2), in the `Either[String, Unit]` style of `HaPreconditions.validate`:
+    * only the numbers, and a port another door already binds. `otherPorts` are the `(door, port)`
+    * pairs of the listeners that are on. A disabled edge is never checked, so a stale override on a
+    * switched-off block cannot stop a boot.
+    */
+  def validate(cfg: RestEdgeConfig, otherPorts: List[(String, Int)]): Either[String, Unit] =
+    def atLeast(value: Int, min: Int, env: String): Option[String] =
+      Option.when(value < min)(s"$env must be >= $min, got $value")
+    if !cfg.enabled then Right(())
+    else
+      val problems = List(
+        Option.when(cfg.port < 1 || cfg.port > 65535)(
+          s"QOD_REST_PORT must be in 1..65535, got ${cfg.port}"
+        ),
+        atLeast(cfg.defaultLimit, 1, "QOD_REST_DEFAULT_LIMIT"),
+        Option.when(cfg.maxRows < cfg.defaultLimit)(
+          s"QOD_REST_MAX_ROWS (${cfg.maxRows}) must be >= QOD_REST_DEFAULT_LIMIT " +
+            s"(${cfg.defaultLimit})"
+        ),
+        atLeast(cfg.stmtTimeoutSec, 1, "QOD_REST_STMT_TIMEOUT_SEC"),
+        atLeast(cfg.maxConnections, 1, "QOD_REST_MAX_CONNECTIONS"),
+        // Below 1 KiB a request line plus one bearer token no longer fits.
+        atLeast(cfg.maxHeaderBytes, 1024, "QOD_REST_MAX_HEADER_BYTES"),
+        atLeast(cfg.headerReceiveTimeoutSec, 1, "QOD_REST_HEADER_RECEIVE_TIMEOUT_SEC"),
+        atLeast(cfg.idleTimeoutSec, 1, "QOD_REST_IDLE_TIMEOUT_SEC"),
+        otherPorts.collectFirst {
+          case (door, p) if p == cfg.port =>
+            s"QOD_REST_PORT ${cfg.port} is already bound by the $door listener"
+        }
+      ).flatten
+      problems.headOption.map(p => s"quack-rest: $p").toLeft(())
