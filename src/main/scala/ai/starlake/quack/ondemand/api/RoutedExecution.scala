@@ -51,10 +51,15 @@ object RoutedExecution:
     // FlightSqlRouter already has between register and attachCancel. Durable cancellation
     // (bracketing the connection inside QuackHttpClient) is deliberately deferred to a later
     // sub-project; do not describe this branch as killing or aborting the statement.
+    // BoundedWait rather than timeoutTo: timeoutTo cannot interrupt IO.blocking, so it sat on the
+    // node call past the limit, then dropped the result without closing it (its Arrow reader and
+    // its kill-registry entry leaked). A result that arrives late is now closed exactly once.
     caller.restriction.stmtTimeoutMs match
       case Some(ms) if ms > 0 =>
-        execute.timeoutTo(
+        BoundedWait.closingLate(
+          execute,
           FiniteDuration(ms.toLong, TimeUnit.MILLISECONDS),
-          IO.pure(Left(RouterFailure.Unavailable(s"statement exceeded this token's ${ms}ms limit")))
+          RouterFailure.Unavailable(s"statement exceeded this token's ${ms}ms limit"),
+          _.close()
         )
       case _ => execute

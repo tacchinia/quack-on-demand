@@ -2,7 +2,7 @@ package ai.starlake.quack.ondemand.api
 
 import ai.starlake.quack.edge.adapter.*
 import ai.starlake.quack.edge.sql.{Denied, StatementValidator, ValidationContext, ValidationResult}
-import ai.starlake.quack.edge.{FlightSqlRouter, SessionRegistry}
+import ai.starlake.quack.edge.{FlightSqlRouter, RouterFailure, SessionRegistry}
 import ai.starlake.quack.model.{
   NodeSpec,
   PoolKey,
@@ -12,6 +12,7 @@ import ai.starlake.quack.model.{
   TenantDbKind
 }
 import ai.starlake.quack.ondemand.PoolSupervisor
+import ai.starlake.quack.ondemand.auth.TokenRestriction
 import ai.starlake.quack.ondemand.runtime.QuackBackend
 import ai.starlake.quack.ondemand.state.InMemoryControlPlaneStore
 import ai.starlake.quack.ondemand.telemetry.EventJournal
@@ -22,10 +23,13 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
 import java.time.Instant
+import java.util.concurrent.{CountDownLatch, TimeUnit}
 import scala.collection.concurrent.TrieMap
+import scala.concurrent.duration.*
 
 /** The router call behind every [[CatalogPreviewHandlers.PreviewExecutor]] (MCP, preview, diff,
-  * restore, undrop, and the REST edge): what the caller value carries must reach the router.
+  * restore, undrop, and the REST edge): what the caller value carries must reach the router, and a
+  * token timeout must not leak the result it stops waiting for.
   */
 class RoutedExecutionSpec extends AnyFlatSpec with Matchers:
 
@@ -90,6 +94,9 @@ class RoutedExecutionSpec extends AnyFlatSpec with Matchers:
     )
     Fixture(router, journal, store, sup.get(poolKey).get.nodes)
 
+  private def timed(ms: Int): TokenRestriction =
+    TokenRestriction.Unrestricted.copy(stmtTimeoutMs = Some(ms))
+
   "RoutedExecution.run" should "route to the caller's preferred node" in:
     val fx     = setup(nodeCount = 3)
     val target = fx.nodes(2).nodeId
@@ -128,3 +135,38 @@ class RoutedExecutionSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync()
     fx.journal.drainNow()
     fx.store.events.map(_.origin) shouldBe List("flightsql")
+
+  it should "answer within the token's limit and close the result that arrives late" in:
+    val release = new CountDownLatch(1)
+    // The node call blocks like the real one (IO.blocking, not interruptible by cancellation) and
+    // answers after 1.5s whatever happens, so a wait that is not bounded shows up as elapsed time
+    // rather than as a hung suite.
+    val fx = setup(respond =
+      () => IO.blocking { release.await(1500, TimeUnit.MILLISECONDS); TestArrow.okResponse() }
+    )
+    val caller = ExecCaller("c-4", "alice", timed(50))
+    val t0     = System.nanoTime()
+    val out    = RoutedExecution
+      .run(fx.router, caller, poolKey, "SELECT 1", None, recordExecution = true)
+      .unsafeRunSync()
+    (System.nanoTime() - t0).nanos should be < 1.second
+    out match
+      case Left(RouterFailure.Unavailable(m)) => m should include("50ms")
+      case other                              => fail(s"expected Unavailable, got $other")
+    // The statement is still running on the node and still registered.
+    fx.router.registry.list() should have size 1
+    release.countDown()
+    // Closing the late result deregisters it; a plain timeoutTo dropped it and nothing ever did.
+    val deadline = System.nanoTime() + 5.seconds.toNanos
+    while fx.router.registry.list().nonEmpty && System.nanoTime() < deadline do Thread.sleep(10)
+    fx.router.registry.list() shouldBe empty
+
+  it should "hand a result delivered within the limit to the caller, still open" in:
+    val fx  = setup()
+    val out = RoutedExecution
+      .run(fx.router, ExecCaller("c-5", "alice", timed(5000)), poolKey, "SELECT 1", None, true)
+      .unsafeRunSync()
+    out shouldBe a[Right[?, ?]]
+    fx.router.registry.list() should have size 1
+    out.foreach(_.close())
+    fx.router.registry.list() shouldBe empty
