@@ -8,7 +8,7 @@ import ai.starlake.quack.edge.sql.PostgresAclValidator
 import ai.starlake.quack.ondemand.api.{CatalogPreviewHandlers, ErrorResponse}
 import ai.starlake.quack.ondemand.auth.{PatPrincipal, SessionScope, TokenRestriction}
 import ai.starlake.quack.ondemand.catalog.DuckLakeCatalogReader
-import ai.starlake.quack.ondemand.state.{RoleColumnPolicy, RolePermission}
+import ai.starlake.quack.ondemand.state.{RoleColumnPolicy, RolePermission, RoleRowPolicy}
 import cats.effect.unsafe.implicits.global
 import io.circe.Json
 import io.circe.parser.parse
@@ -121,7 +121,8 @@ class RestDiscoveryScopeSpec extends AnyFlatSpec with Matchers:
       kc: KindCase,
       filteredMetadata: Boolean = true,
       permissions: List[RolePermission] = Nil,
-      columnPolicies: List[RoleColumnPolicy] = Nil
+      columnPolicies: List[RoleColumnPolicy] = Nil,
+      rowPolicies: List[RoleRowPolicy] = Nil
   )(body: RestEdgeHandlers => A): A =
     withDuckDb(kc.catalog) { conn =>
       seed(conn, kc.catalog)
@@ -135,7 +136,7 @@ class RestDiscoveryScopeSpec extends AnyFlatSpec with Matchers:
         metadataFilter = new MetadataFilterRewriter(enabled = filteredMetadata),
         respond = node(conn)
       )
-      val eff = effWith(permissions = permissions, columnPolicies = columnPolicies)
+      val eff = effWith(permissions, columnPolicies, rowPolicies)
       val executor: CatalogPreviewHandlers.PreviewExecutor = (caller, key, sql) =>
         h.router.execute(
           caller.connectionId,
@@ -240,9 +241,6 @@ class RestDiscoveryScopeSpec extends AnyFlatSpec with Matchers:
   private val maskEmail =
     RoleColumnPolicy("cp-mask", "r-1", "*", "main", "customer", "c_email", "mask", Some("'***'"))
 
-  /** Kinds whose statements carry no `AT` clause; DuckLake's wait on spike S1 (below). */
-  private val NoSnapshotKinds = List(DuckDbFile, Memory)
-
   private val maskedRows = Right(
     Json.arr(
       Json.obj(
@@ -259,7 +257,7 @@ class RestDiscoveryScopeSpec extends AnyFlatSpec with Matchers:
   )
 
   "a masked column" should "be listed and served as an ordinary column (Q5)" in {
-    for kc <- NoSnapshotKinds do
+    for kc <- AllKinds do
       withClue(s"${kc.kind}: ") {
         withHandlers(kc, permissions = grants(kc), columnPolicies = List(maskEmail)) { h =>
           columnsOf(h.table("acme", db(kc), "main", "customer", req()).unsafeRunSync()) shouldBe
@@ -276,7 +274,7 @@ class RestDiscoveryScopeSpec extends AnyFlatSpec with Matchers:
   // included. The probe is therefore refused, fail-closed, and the whole table answers the one 404.
   // Pinned so a rewriter change is visible; the drop expectation is kept, ignored, below.
   "a denied column" should "hide its whole table today, since the rewriter refuses the probe's star" in {
-    for kc <- NoSnapshotKinds do
+    for kc <- AllKinds do
       withClue(s"${kc.kind}: ") {
         withHandlers(kc, permissions = grants(kc), columnPolicies = List(denySsn)) { h =>
           val missing = h.table("acme", db(kc), "main", "no_such_table", req()).unsafeRunSync()
@@ -288,7 +286,7 @@ class RestDiscoveryScopeSpec extends AnyFlatSpec with Matchers:
   }
 
   ignore should "be absent from the detail and unknown to select, order and filters (drop semantics of §6.2)" in {
-    for kc <- NoSnapshotKinds do
+    for kc <- AllKinds do
       withHandlers(kc, permissions = grants(kc), columnPolicies = List(denySsn)) { h =>
         columnsOf(h.table("acme", db(kc), "main", "customer", req()).unsafeRunSync()) shouldBe
           List("c_id" -> "INTEGER", "c_email" -> "VARCHAR")
@@ -301,25 +299,20 @@ class RestDiscoveryScopeSpec extends AnyFlatSpec with Matchers:
       }
   }
 
-  // KNOWN GAP (spike S1, RestTimeTravelPolicySpec): on DuckLake the edge always pins a snapshot, and
-  // the column/row-policy rewriters refuse `AT (VERSION => n)` fail-closed, so a principal holding
-  // any column policy gets 404 for every table. The expectation below is the correct one; it turns
-  // green once the rewriters keep the clause (the fix belongs in the rewriters, not the edge).
-  "on DuckLake, a column policy" should "hide every table today: the rewriter refuses AT (S1)" in
-    withHandlers(DuckLake, permissions = grants(DuckLake), columnPolicies = List(maskEmail)) { h =>
-      h.table("acme", db(DuckLake), "main", "customer", req())
-        .unsafeRunSync()
-        .left
-        .map(_._1) shouldBe
-        Left(StatusCode.NotFound)
-    }
-
-  ignore should "apply at the pinned snapshot (KNOWN GAP S1)" in
-    withHandlers(DuckLake, permissions = grants(DuckLake), columnPolicies = List(maskEmail)) { h =>
-      h.rows("acme", db(DuckLake), "main", "customer", req("order=c_id"))
-        .unsafeRunSync()
-        .map(ok => parse(ok.body).toOption.get) shouldBe maskedRows
-    }
+  // DuckLake statements always carry `AT (VERSION => n)` (the edge pins a snapshot), which the
+  // policy rewriters keep since the S1 fix (TimeTravelCarrier): the policies apply on every kind.
+  "a row policy" should "filter /rows on every kind, DuckLake's pinned snapshot included" in {
+    val onlyTwo = RoleRowPolicy("rp-d", "r-1", "*", "main", "customer", "c_id = 2")
+    for kc <- AllKinds do
+      withClue(s"${kc.kind}: ") {
+        withHandlers(kc, permissions = grants(kc), rowPolicies = List(onlyTwo)) { h =>
+          h.rows("acme", db(kc), "main", "customer", req("select=c_id&order=c_id"))
+            .unsafeRunSync()
+            .map(ok => parse(ok.body).toOption.get) shouldBe
+            Right(Json.arr(Json.obj("c_id" -> Json.fromInt(2))))
+        }
+      }
+  }
 
   // ---- D4 ------------------------------------------------------------------------------------
 
