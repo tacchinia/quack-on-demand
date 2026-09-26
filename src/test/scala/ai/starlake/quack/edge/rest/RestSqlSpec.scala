@@ -6,9 +6,9 @@ import org.scalatest.matchers.should.Matchers
 import java.sql.DriverManager
 import scala.util.Using
 
-/** U3 of design §11.1: golden SQL for every operator, LIKE escaping, the three-part name for each
-  * kind, `AT`, `LIMIT n+1 OFFSET`, and the absence of ordinals and `*`; plus a semantic check of
-  * the same statements in in-process DuckDB.
+/** U3 of design §11.1: golden SQL for every operator, the linear LIKE forms, the three-part name
+  * for each kind, `AT`, `LIMIT n+1 OFFSET`, and the absence of ordinals and `*`; plus a semantic
+  * check of the same statements in in-process DuckDB.
   */
 class RestSqlSpec extends AnyFlatSpec with Matchers:
 
@@ -81,13 +81,20 @@ class RestSqlSpec extends AnyFlatSpec with Matchers:
     where("ok" -> "not.is.false") shouldBe """"ok" IS NOT FALSE"""
   }
 
-  it should "render like and ilike, with ESCAPE only when something was escaped" in {
+  it should "render like as LIKE and ilike as lower() LIKE lower(), never ILIKE or ESCAPE" in {
     where("name" -> "like.a*b") shouldBe """"name" LIKE CAST('a%b' AS VARCHAR)"""
-    where("name" -> "ilike.*x") shouldBe """"name" ILIKE CAST('%x' AS VARCHAR)"""
-    where("name" -> "like.5%_\\*") shouldBe
-      """"name" LIKE CAST('5\%\_\\%' AS VARCHAR) ESCAPE '\'"""
+    where("name" -> "ilike.*x") shouldBe """lower("name") LIKE lower(CAST('%x' AS VARCHAR))"""
+    where("name" -> "like.x\\y*") shouldBe """"name" LIKE CAST('x\y%' AS VARCHAR)"""
+  }
+
+  it should "render a pattern with a literal % or _ as equality, prefix, suffix or contains" in {
+    where("name" -> "like.5%_\\") shouldBe """"name" = CAST('5%_\' AS VARCHAR)"""
+    where("name" -> "like.5%*") shouldBe """starts_with("name", CAST('5%' AS VARCHAR))"""
+    where("name" -> "like.*_c") shouldBe """ends_with("name", CAST('_c' AS VARCHAR))"""
+    where("name" -> "ilike.*it's%*") shouldBe
+      """contains(lower("name"), lower(CAST('it''s%' AS VARCHAR)))"""
     where("name" -> "not.ilike.a_") shouldBe
-      """NOT ("name" ILIKE CAST('a\_' AS VARCHAR) ESCAPE '\')"""
+      """NOT (lower("name") = lower(CAST('a_' AS VARCHAR)))"""
   }
 
   it should "AND several filters in arrival order" in {
@@ -158,7 +165,14 @@ class RestSqlSpec extends AnyFlatSpec with Matchers:
       ids("name" -> "like.a*") shouldBe List(1)
       ids("name" -> "ilike.a_c") shouldBe List(2)
       ids("name" -> "ilike.a*") shouldBe List(1, 2)
+      ids("name" -> "ilike.A*") shouldBe List(1, 2)
       ids("name" -> "like.x\\y") shouldBe List(4)
+      ids("name" -> "like.x\\*") shouldBe List(4)
+      ids("name" -> "like.*%*") shouldBe List(1)
+      ids("name" -> "like.a%*") shouldBe List(1)
+      ids("name" -> "like.*_c") shouldBe List(2)
+      ids("name" -> "ilike.*_C") shouldBe List(2)
+      ids("name" -> "not.like.*_*") shouldBe List(1, 4)
       ids("name" -> "is.null") shouldBe List(3)
       ids("name" -> "not.is.null") shouldBe List(1, 2, 4)
       ids("ok" -> "is.true") shouldBe List(1, 4)

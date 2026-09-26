@@ -24,6 +24,27 @@ object FilterOp:
   private val byWire: Map[String, FilterOp] = values.map(o => o.wire -> o).toMap
   def fromWire(s: String): Option[FilterOp] = byWire.get(s)
 
+/** How a `like`/`ilike` value is rendered (§6.3, spike S8). Every form keeps DuckDB on a linear
+  * matcher: a LIKE pattern made of `%` and literal text only runs on DuckDB's segment matcher,
+  * while any `_` or `ESCAPE` falls back to a backtracking matcher that costs length^(inner
+  * wildcards), seconds for one 4 KiB value with two inner wildcards. A value holding a literal `%`
+  * or `_` therefore never becomes a LIKE: with `*` only at its ends it is exactly an equality, a
+  * prefix, a suffix or a substring test, and any other shape is refused.
+  *
+  * `ilike` is the same form over `lower(col)` and `lower(value)`, never ILIKE (backtracking too).
+  * On DuckDB 1.5.4 the result equals ILIKE for ASCII and for every BMP character checked (ILIKE
+  * also lowercases per code point on non-ASCII input); neither applies full case folding, so `ß`
+  * does not match `ss` under either.
+  */
+enum PatternForm:
+  /** `text` is a LIKE pattern: `*` mapped to `%`, no `_`, no escape. `\` is an ordinary character,
+    * since DuckDB's LIKE has no default escape.
+    */
+  case Like
+
+  /** `text` is the literal needle, the value without its edge `*`s. */
+  case Equals, StartsWith, EndsWith, Contains
+
 /** The comparison operators and their SQL spelling (`neq` is `<>`, §6.3). */
 enum Comparison(val sql: String):
   case Eq  extends Comparison("=")
@@ -39,11 +60,8 @@ enum Predicate:
   /** `eq neq gt gte lt lte`: the raw text, type-checked later against the probed column. */
   case Compare(cmp: Comparison, raw: String)
 
-  /** `like ilike`: the pattern with `*` mapped to `%` and a literal `%`, `_` or `\` escaped with
-    * `\`. `escaped` says whether any escape was written, which is when (and only when) `RestSql`
-    * emits `ESCAPE '\'` (§6.3).
-    */
-  case Pattern(caseInsensitive: Boolean, sqlPattern: String, escaped: Boolean)
+  /** `like ilike`: `text` is read according to `form` (see [[PatternForm]]). */
+  case Pattern(caseInsensitive: Boolean, form: PatternForm, text: String)
 
   /** `in`: the decoded items, each type-checked later like a [[Compare]] value. */
   case Items(items: Vector[String])
@@ -101,7 +119,7 @@ final case class RestQuery(
 
 object RestQuery:
 
-  /** Hard caps of §6.3. `MaxWildcards` is subject to spike S8. */
+  /** Hard caps of §6.3. `MaxWildcards` holds for LIKE patterns, which stay linear (spike S8). */
   val MaxFilters       = 32
   val MaxInItems       = 64
   val MaxOrderTerms    = 16
@@ -368,7 +386,9 @@ object RestQuery:
       case FilterOp.Lt    => compare(Comparison.Lt)
       case FilterOp.Lte   => compare(Comparison.Lte)
 
-  /** `*` -> `%`; a literal `%`, `_` or `\` is escaped with `\` (§6.3). */
+  /** `*` is the only wildcard (§6.3). Without a literal `%` or `_` the value is a LIKE pattern;
+    * with one, `*` may only open or close it and the value becomes a needle ([[PatternForm]]).
+    */
   private def likePattern(
       name: String,
       v: String,
@@ -378,15 +398,23 @@ object RestQuery:
     if v.isEmpty then Left(RestError.invalidFilter(name, "empty value"))
     else if wildcards > MaxWildcards then
       Left(RestError.invalidFilter(name, s"at most $MaxWildcards wildcards"))
+    else if !v.exists(c => c == '%' || c == '_') then
+      Right(Predicate.Pattern(caseInsensitive, PatternForm.Like, v.replace('*', '%')))
     else
-      val sb      = new StringBuilder(v.length + 8)
-      var escaped = false
-      v.foreach {
-        case '*'                    => sb.append('%')
-        case c @ ('%' | '_' | '\\') => sb.append('\\').append(c); escaped = true
-        case c                      => sb.append(c)
-      }
-      Right(Predicate.Pattern(caseInsensitive, sb.toString, escaped))
+      val leading  = v.startsWith("*")
+      val trailing = v.endsWith("*")
+      val needle   = v.dropWhile(_ == '*').reverse.dropWhile(_ == '*').reverse
+      if needle.contains('*') then
+        Left(
+          RestError.invalidFilter(name, "with a literal % or _, * may only start or end a pattern")
+        )
+      else
+        val form = (leading, trailing) match
+          case (false, false) => PatternForm.Equals
+          case (false, true)  => PatternForm.StartsWith
+          case (true, false)  => PatternForm.EndsWith
+          case (true, true)   => PatternForm.Contains
+        Right(Predicate.Pattern(caseInsensitive, form, needle))
 
   /** `"(" item ("," item)* ")"`; `item := bare | '"' quoted '"'`, quoted with `\"` and `\\`
     * escapes. A bare item is non-empty and holds none of `, ( ) "`.

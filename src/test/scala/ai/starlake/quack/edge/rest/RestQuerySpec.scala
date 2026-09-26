@@ -10,11 +10,11 @@ import java.time.Instant
 class RestQuerySpec extends AnyFlatSpec with Matchers:
 
   private def parse(ps: (String, String)*): Either[RestError, RestQuery] = RestQuery.parse(ps)
-  private def ok(ps: (String, String)*): RestQuery                        =
+  private def ok(ps: (String, String)*): RestQuery                       =
     parse(ps*).fold(e => fail(s"unexpected ${e.code}: ${e.message}"), identity)
-  private def code(ps: (String, String)*): String                         =
+  private def code(ps: (String, String)*): String =
     parse(ps*).fold(_.code, q => fail(s"expected an error, got $q"))
-  private def only(ps: (String, String)*): Filter                         =
+  private def only(ps: (String, String)*): Filter =
     val q = ok(ps*); q.filters should have size 1; q.filters.head
 
   "parse" should "build a comparison for each of eq neq gt gte lt lte, with and without not." in {
@@ -35,10 +35,29 @@ class RestQuerySpec extends AnyFlatSpec with Matchers:
     only("a" -> "eq.1.5.x").predicate shouldBe Predicate.Compare(Comparison.Eq, "1.5.x")
   }
 
-  it should "map like and ilike patterns, escaping only when a literal needs it" in {
-    only("a" -> "like.ab*").predicate shouldBe Predicate.Pattern(false, "ab%", false)
-    only("a" -> "not.ilike.*x*").predicate shouldBe Predicate.Pattern(true, "%x%", false)
-    only("a" -> "like.50%_\\*").predicate shouldBe Predicate.Pattern(false, "50\\%\\_\\\\%", true)
+  it should "map a pattern without a literal % or _ to a LIKE pattern, * to %, \\ kept as is" in {
+    only("a" -> "like.ab*").predicate shouldBe Predicate.Pattern(false, PatternForm.Like, "ab%")
+    only("a" -> "not.ilike.*x*").predicate shouldBe
+      Predicate.Pattern(true, PatternForm.Like, "%x%")
+    only("a" -> "like.*a\\b*c*d").predicate shouldBe
+      Predicate.Pattern(false, PatternForm.Like, "%a\\b%c%d")
+  }
+
+  it should "map a pattern with a literal % or _ to a linear form by where its wildcards sit" in {
+    only("a" -> "like.50%_").predicate shouldBe
+      Predicate.Pattern(false, PatternForm.Equals, "50%_")
+    only("a" -> "like.50%*").predicate shouldBe
+      Predicate.Pattern(false, PatternForm.StartsWith, "50%")
+    only("a" -> "ilike.**_x").predicate shouldBe
+      Predicate.Pattern(true, PatternForm.EndsWith, "_x")
+    only("a" -> "not.like.*50%\\*").predicate shouldBe
+      Predicate.Pattern(false, PatternForm.Contains, "50%\\")
+  }
+
+  it should "refuse a literal % or _ in a pattern with an inner wildcard (spike S8)" in {
+    code("a" -> "like.a*5%") shouldBe "invalid_filter"
+    code("a" -> "ilike.*a*_*") shouldBe "invalid_filter"
+    code("a" -> "like._*_") shouldBe "invalid_filter"
   }
 
   it should "parse in lists with bare and quoted items, including , ) \" and \\ inside quotes" in {
@@ -76,13 +95,21 @@ class RestQuerySpec extends AnyFlatSpec with Matchers:
   }
 
   it should "parse select, limit, offset, pool, format and each asOf selector" in {
-    val q = ok("select" -> "a,B", "limit" -> "10", "offset" -> "20", "order" -> "a",
-      "pool" -> "p1", "format" -> "csv")
+    val q = ok(
+      "select" -> "a,B",
+      "limit"  -> "10",
+      "offset" -> "20",
+      "order"  -> "a",
+      "pool"   -> "p1",
+      "format" -> "csv"
+    )
     (q.select, q.limit, q.offset, q.pool, q.format) shouldBe
       (Some(Vector("a", "B")), Some(10), 20, Some("p1"), Some("csv"))
     ok("asOf" -> "42").asOf shouldBe Some(42L)
     ok("asOfTag" -> "v1").asOfTag shouldBe Some("v1")
-    ok("asOfTs" -> "2024-01-01T00:00:00Z").asOfTs shouldBe Some(Instant.parse("2024-01-01T00:00:00Z"))
+    ok("asOfTs" -> "2024-01-01T00:00:00Z").asOfTs shouldBe Some(
+      Instant.parse("2024-01-01T00:00:00Z")
+    )
     ok("limit" -> "2147483647").limit shouldBe Some(Int.MaxValue)
     ok("offset" -> "0").offset shouldBe 0
   }
@@ -97,8 +124,16 @@ class RestQuerySpec extends AnyFlatSpec with Matchers:
   }
 
   it should "refuse an unbalanced or malformed in list" in {
-    for bad <- List("in.(1,2", "in.1,2)", "in.()", "in.(1,,2)", "in.(\"a)", "in.(\"a\"b)",
-        "in.(\"a\\x\")", "in.(a(b)")
+    for bad <- List(
+        "in.(1,2",
+        "in.1,2)",
+        "in.()",
+        "in.(1,,2)",
+        "in.(\"a)",
+        "in.(\"a\"b)",
+        "in.(\"a\\x\")",
+        "in.(a(b)"
+      )
     do withClue(bad)(code("a" -> bad) shouldBe "invalid_filter")
   }
 
@@ -197,13 +232,13 @@ class RestQuerySpec extends AnyFlatSpec with Matchers:
   it should "never echo a parameter value in an error message" in {
     val secret = "secret@x.io"
     for ps <- List(
-        Seq("email" -> s"bogus.$secret"),
-        Seq("email" -> s"in.($secret"),
-        Seq("limit" -> secret),
-        Seq("asOf" -> secret),
+        Seq("email"  -> s"bogus.$secret"),
+        Seq("email"  -> s"in.($secret"),
+        Seq("limit"  -> secret),
+        Seq("asOf"   -> secret),
         Seq("asOfTs" -> secret),
         Seq("branch" -> secret),
-        Seq("email" -> (s"eq.$secret" + "x" * 5000))
+        Seq("email"  -> (s"eq.$secret" + "x" * 5000))
       )
     do
       val e = parse(ps*).left.toOption.get
@@ -227,8 +262,10 @@ class RestQuerySpec extends AnyFlatSpec with Matchers:
 
   it should "refuse an invalid percent sequence or invalid UTF-8" in {
     for bad <- List("a=%", "a=%4", "a=%zz", "a%=1", "a=%C3", "a=%FF", "a=%C3%28") do
-      withClue(bad)(RestQuery.decodeQueryString(bad).left.map(_.code) shouldBe
-        Left("invalid_parameter"))
+      withClue(bad)(
+        RestQuery.decodeQueryString(bad).left.map(_.code) shouldBe
+          Left("invalid_parameter")
+      )
   }
 
   it should "surface a decoded NUL for parse to refuse" in {
