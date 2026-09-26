@@ -192,6 +192,29 @@ All seven spikes block slice 1.
 | S7 | Does the fully qualified `"<catalog>"."<schema>"."<name>"` keep name resolution inside the tenant catalog for every kind? That includes `memory`, whose session catalog is DuckDB's built-in `memory` (`model/DuckDbCatalogs.scala:13`). | Report it to the maintainer and fix it in the validator (constraint 1). |
 | S8 | How expensive is the worst LIKE pattern the caps allow, measured on the pinned DuckDB? | Lower the wildcard cap (§6.3). |
 
+**Outcomes (phase 1a, 2026-09-26).** Tests live in `src/test/.../edge/rest/`. A gap is pinned by an
+active characterization plus an ignored `KNOWN GAP` test holding the correct expectation (the
+precedent of `ColumnPolicyRewriterSpec`); no production code was changed by the spikes.
+
+- **S1: GAP, fails closed.** `ColumnPolicyRewriter` and `RowPolicyRewriter` parse the raw text,
+  jsqlparser rejects `AT (VERSION => n)`, and the router denies: a principal with any column or row
+  policy cannot read at a snapshot. Without the clause both policies apply. Fix in the rewriters
+  (strip and re-attach the clause, as the ACL parser and the metadata filter already do) before
+  the edge sends `AT`. `RestTimeTravelPolicySpec`.
+- **S2: BLOCKED on this machine** (the `ducklake` extension cannot be downloaded). The test
+  cancels here; when it runs it fails only if `AT` on a view is accepted but ignored.
+  `RestViewTimeTravelSpec`.
+- **S7: OK.** Under a schema-wide grant the validator denies three-part names of any other
+  catalog, and DuckDB never resolves a three-part name outside its catalog; a two-part name can
+  fall back to the session's `temp` catalog, which is why the edge always qualifies fully. Note: on
+  a `memory` tenant-db a `*` catalog grant admits nothing, because the validator's tenant catalog
+  set holds tenant-db names, not `memory` (fails closed; usability only). `RestCatalogConfinementSpec`.
+- **S8: GAP in the cap.** Plain LIKE is linear (about 0.6 ms per KiB). ILIKE, and LIKE rendered with
+  `ESCAPE`, grow as length^(wildcards-1): with 4 wildcards one 4 KiB value costs about 35 s. Two
+  wildcards cost about 25 ms at 4 KiB, and `lower(col) LIKE lower(p)` stays linear. Consequence for
+  §6.3: render `ilike` as `lower(col) LIKE lower(pattern)`, and allow at most 2 wildcards whenever
+  the pattern needs `ESCAPE`. `RestLikePatternCostSpec`.
+
 ---
 
 ## 3. Architecture
