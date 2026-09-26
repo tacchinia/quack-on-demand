@@ -298,6 +298,11 @@ qod auth pat revoke --id pat-...
 `--max-rows`). A flag left off the command line is unrestricted on that axis, not empty -
 same rule as the REST body above.
 
+The `tools` axis also governs the read-only REST data edge through the reserved name
+`rest` (no MCP tool can take that name): a token with no `--tool` flag may use the edge,
+a token minted with `--tool` must include `--tool rest` to use it. See "Reading over HTTP
+(REST data edge)" below.
+
 The MCP server lives at `POST /mcp` on the manager port (`QOD_MCP_ENABLED`, default
 true). Auth is `Authorization: Bearer <PAT or QOD_API_KEY>`; session JWTs are refused
 there. Point Claude Code at it with:
@@ -1571,6 +1576,83 @@ Things to know:
 - **Personal access tokens are not accepted** on this wire (same rule as FlightSQL); use
   a user and password or an OIDC bearer.
 
+## Reading over HTTP (REST data edge)
+
+A read-only HTTP listener for tools that speak nothing else (n8n, Zapier, a spreadsheet
+import, a cache): tables and views as `GET` resources, JSON or CSV. Off by default; turn
+it on with `QOD_REST_ENABLED=true` in the manager's environment (Helm: `rest.enabled=true`,
+which also creates the `<release>-rest` Service). Port `31339` (`QOD_REST_PORT`), TLS on by
+default with the FlightSQL edge's certificate (`QOD_REST_TLS_ENABLED=false` for plain HTTP
+on a trusted network only). The boot banner prints a `REST (data)` line when it is up.
+
+**Credentials: personal access tokens only.** Never the static `X-API-Key`, a session
+cookie, HTTP Basic or `?access_token=`. A superuser's token is refused (401): mint it from a
+tenant user. The URL's tenant must be the token owner's tenant (otherwise 403 `forbidden`).
+The token's `tools` axis must be unrestricted or include `rest`; its `databases`, `pools`
+and `maxRows` / `stmtTimeoutMs` axes apply as everywhere else.
+
+```bash
+# 1. As the tenant user who will read (or an admin minting for a service user's session):
+qod auth pat create --name n8n-orders --tool rest --database acme_tpch --max-rows 5000
+# {"id":"pat-...","token":"qod_pat_..."}   <- printed once
+TOKEN=qod_pat_...
+BASE=https://localhost:31339/api/v1/tenant/acme/database/acme_tpch
+
+# 2. The four endpoints (-k: the default certificate is self-signed)
+curl -k -H "Authorization: Bearer $TOKEN" "$BASE/schemas"
+curl -k -H "Authorization: Bearer $TOKEN" "$BASE/schemas/tpch1/tables"
+curl -k -H "Authorization: Bearer $TOKEN" "$BASE/schemas/tpch1/tables/orders"
+curl -k -H "Authorization: Bearer $TOKEN" \
+  "$BASE/schemas/tpch1/tables/orders/rows?select=o_orderkey,o_totalprice&o_orderstatus=eq.F&order=o_orderkey&limit=100"
+
+# CSV instead of JSON
+curl -k -H "Authorization: Bearer $TOKEN" "$BASE/schemas/tpch1/tables/orders/rows?limit=10&format=csv"
+```
+
+`/rows` parameters:
+
+- `select=a,b` (default: every column the caller may see), `order=a.desc.nullslast,b`,
+  `limit` (default `QOD_REST_DEFAULT_LIMIT`, 1000), `offset` (needs `order`), `pool=<name>`,
+  `format=json|csv` (or the `Accept` header).
+- Filters: `<column>=<op>.<value>` with `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`,
+  `ilike` (`*` is the wildcard, at most 4), `in.(a,b,"c,d")`, `is.null|true|false`, each
+  negatable with `not.` (`status=not.in.(X,Y)`). Repeating a filter ANDs it.
+- DuckLake only: `asOf=<snapshot id>`, `asOfTag=<tag>` or `asOfTs=<ISO-8601>`. Every page
+  carries `X-QoD-Snapshot`; send it back as `asOf` on the next page so writes landing
+  in between do not shift the rows. A non-DuckLake database answers 400 `invalid_kind`.
+- Headers: `Content-Range: <first>-<last>/*`, and `X-QoD-Truncated: true` when a server or
+  token cap (not your own `limit`) cut the page. Rows are capped at
+  `min(limit, QOD_REST_MAX_ROWS, the token's maxRows)`.
+
+Things to know:
+
+- **Same policy as every door.** Grants, pool permissions, row filters and column masks
+  apply; masked columns look like ordinary columns. Audit rows carry origin `rest` and
+  the token's id. An object the caller cannot read answers the same 404 as one that does
+  not exist, and a schema with nothing readable is a 404 too. Listings are narrowed to
+  the caller's grants by `QOD_ACL_FILTERED_METADATA` (default on); with it off they need a
+  grant on `information_schema` and answer 404 without one.
+- **Reserved names.** `select`, `order`, `limit`, `offset`, `asOf`, `asOfTag`, `asOfTs`,
+  `pool`, `format` and `branch` are parameters, never filters: `limit=eq.5` on a table
+  with a column named `limit` answers 400 `reserved_column`. Workaround: a view that
+  renames the column, granted instead of the table.
+- **Caching.** Responses are `Cache-Control: private` with `Vary: Authorization`; only a
+  DuckLake read pinned by `asOf`/`asOfTag` is cacheable (5 minutes).
+- **CSV is not formula-escaped.** A value starting with `=`, `+`, `-` or `@` reaches a
+  spreadsheet as written.
+- **Cold pools.** A hibernated pool wakes on the first request; if it is not ready within
+  the resume hold (`PROXY_RESUME_HOLD_TIMEOUT_SEC`) the answer is 503 `pool_resuming` with
+  `Retry-After: 5`. A statement past `QOD_REST_STMT_TIMEOUT_SEC` answers 504.
+- **Internet exposure requires a reverse proxy or WAF in front of the port that
+  rate-limits per client and per `Authorization` value.** The edge has no per-client
+  throttle of its own yet: every bad token costs a control-plane lookup, and a valid token
+  can run heavy reads concurrently, bounded only by the row and time caps.
+- Errors are `{"error": "<code>", "message": "..."}`: 401 `unauthorized` (one body for every
+  credential failure), 403 `forbidden` / `acl_denied`, 404 `not_found`, 400
+  `invalid_filter` / `unknown_column` / `order_required` / `invalid_parameter`, 406
+  `unsupported_format`, 502 `upstream_error` (the message carries a request id; the
+  node's text is in the manager log at WARN under that id).
+
 ## Hardening (lockdown, pod security, network policy, reader eviction)
 
 Self-serve / hosted deployments need a tighter isolation posture than the OSS
@@ -1685,6 +1767,8 @@ opt-in except pod security:
 | Symptom | Cause | Fix |
 |---|---|---|
 | `/api/*` returns 401 | No valid credential on the call (missing/wrong key, expired session) | `qod login`, or pass `X-API-Key: <key>` on raw REST calls |
+| REST data edge (`:31339`) returns 401 on every call | Not a live PAT of a tenant user: static key, session, superuser-owned or revoked token | Mint a PAT as the tenant user (`qod auth pat create --tool rest ...`) and send `Authorization: Bearer qod_pat_...` |
+| REST data edge returns 403 `forbidden` | Path tenant is not the token's tenant, or the token's `tools` axis lacks `rest` | Fix the URL's tenant, or mint a token with `--tool rest` (or no `--tool` at all) |
 | `no node with role READONLY or DUAL` | All nodes flipped unhealthy (port unreachable) | Check `pgrep -fl spawn-quack-node`; if 0, run `qod stop` + `qod start` (reconcile respawns) |
 | `access denied: missing RO grant on ...` | ACL is enabled and the user has no matching grant | Add the grant via `qod role permission grant` or set `QOD_ACL_ENABLED=false` |
 | `session expired; please reconnect` | Bearer token unknown (manager restarted between calls) | Re-login or pass Basic credentials |
