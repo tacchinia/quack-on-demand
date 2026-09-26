@@ -11,7 +11,7 @@ import ai.starlake.quack.edge.sql.{
   StatementValidator,
   ValidationContext
 }
-import ai.starlake.quack.model.{PoolKey, SqlLiterals, StatementKind, TenantDb}
+import ai.starlake.quack.model.{PoolKey, SessionCatalog, SqlLiterals, StatementKind, TenantDb}
 import ai.starlake.quack.ondemand.PoolSupervisor
 import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import ai.starlake.quack.ondemand.telemetry.{AuditActions, AuditEvent, EventJournal, StatementEvent}
@@ -416,24 +416,17 @@ final class FlightSqlRouter(
     val poolMeta   = maybeState.map(_.metastore).getOrElse(Map.empty)
     val kindWire   = maybeState.map(_.kindWire).getOrElse("ducklake")
 
-    def perKindDb: Option[String] = kindWire match
-      case "ducklake" | "duckdb-file" =>
-        Option(TenantDb.catalogAlias(poolMeta)).filter(_.nonEmpty)
-      case "memory" => Some("memory")
-      case _        => None
-
-    def perKindSchema: Option[String] = kindWire match
-      case "ducklake" | "duckdb-file" => poolMeta.get("schemaName").filter(_.nonEmpty)
-      case "memory"                   => Some("main")
-      case _                          => None
-
+    // One resolver for every door (SessionCatalog): the REST edge qualifies its generated names
+    // from the same call, so the catalog validated here is the catalog the node reads.
     val ctx = ValidationContext(
       username = user,
       database = poolKey.toString,
       statement = sql,
       peer = connectionId,
-      defaultDatabase = maybeState.flatMap(_.defaultDatabase).orElse(perKindDb),
-      defaultSchema = maybeState.flatMap(_.defaultSchema).orElse(perKindSchema),
+      defaultDatabase =
+        SessionCatalog.database(kindWire, poolMeta, maybeState.flatMap(_.defaultDatabase)),
+      defaultSchema =
+        SessionCatalog.schema(kindWire, poolMeta, maybeState.flatMap(_.defaultSchema)),
       effectiveSet = effectiveSet,
       attachedCatalogs = attachedCatalogsOf(poolKey)
     )

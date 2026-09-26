@@ -14,6 +14,7 @@ import ai.starlake.quack.model.{
   Role,
   RoleDistribution,
   RunningNode,
+  SessionCatalog,
   Tenant,
   TenantDbKind
 }
@@ -782,6 +783,142 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
         router.execute("d-3", "alice", key, "SELECT 1").unsafeRunSync()
         capturer.lastCtx.defaultDatabase shouldBe Some("delta_lake")
         capturer.lastCtx.defaultSchema shouldBe Some("myschema")
+
+  // P9 (REST edge design, spec 2026-09-25 §11.4): the session catalog the validator sees is the
+  // one SessionCatalog resolves for the pool, for every kind and metastore shape. The REST edge
+  // qualifies its generated names from the same resolver; if the router derived the catalog on
+  // its own, the ACL could validate one catalog while the node read another.
+  it should "resolve the validation defaults through SessionCatalog for every kind and shape" in:
+    val admin = new ai.starlake.quack.ondemand.state.DbAdmin:
+      def createDatabase(name: String): Either[String, Unit] = Right(())
+      def dropDatabase(name: String): Either[String, Unit]   = Right(())
+    val backend = new QuackBackend:
+      private val n          = TrieMap.empty[String, RunningNode]
+      def start(s: NodeSpec) = IO {
+        val r = RunningNode(
+          s.nodeId,
+          s.poolKey,
+          s.role,
+          "127.0.0.1",
+          25500 + n.size,
+          "tok",
+          Some(6L),
+          None,
+          Instant.EPOCH,
+          maxConcurrent = s.maxConcurrent
+        )
+        n.put(s.nodeId, r); r
+      }
+      def stop(key: PoolKey, id: String) = IO { n.remove(id); () }
+      def isAlive(id: String)            = n.contains(id)
+      def discoverExisting()             = IO.pure(n.values.toList)
+      def cleanup()                      = IO(n.clear())
+    val sup = new PoolSupervisor(
+      backend,
+      new NodeLoadTracker,
+      new InMemoryControlPlaneStore(),
+      dbAdmin = admin
+    )
+    sup.createTenant(Tenant("zeta")).unsafeRunSync()
+    // DuckLake pre-init against pgPort 0 fails fast and is swallowed by design (see the schema
+    // skew test below), so no live Postgres is needed for the ducklake shapes.
+    val pg = Map("pgHost" -> "127.0.0.1", "pgPort" -> "0", "pgUser" -> "u", "pgPassword" -> "p")
+    final case class Shape(
+        suffix: String,
+        kind: TenantDbKind,
+        metastore: Map[String, String],
+        dataPath: String,
+        defaultDatabase: Option[String],
+        expectedDb: Option[String],
+        expectedSchema: Option[String]
+    )
+    val shapes = List(
+      Shape("mem", TenantDbKind.InMemory, Map.empty, "", None, Some("memory"), Some("main")),
+      Shape(
+        "memov",
+        TenantDbKind.InMemory,
+        Map.empty,
+        "",
+        Some("fedpg"),
+        Some("fedpg"),
+        Some("main")
+      ),
+      Shape(
+        "file",
+        TenantDbKind.DuckDbFile,
+        Map("dbName" -> "zeta_file", "schemaName" -> "main"),
+        "/tmp/qod-p9.duckdb",
+        None,
+        Some("zeta_file"),
+        Some("main")
+      ),
+      Shape(
+        "filealias",
+        TenantDbKind.DuckDbFile,
+        Map("dbName" -> "zeta_filealias", "schemaName" -> "main", "catalogAlias" -> "zeta_parent"),
+        "/tmp/qod-p9-alias.duckdb",
+        None,
+        Some("zeta_parent"),
+        Some("main")
+      ),
+      Shape(
+        "lake",
+        TenantDbKind.DuckLake,
+        pg + ("schemaName" -> "curated"),
+        "/tmp/qod-p9-lake",
+        None,
+        Some("zeta_lake"),
+        Some("curated")
+      ),
+      Shape(
+        "lakealias",
+        TenantDbKind.DuckLake,
+        pg ++ Map("schemaName" -> "main", "catalogAlias" -> "zeta_lake"),
+        "/tmp/qod-p9-lake-alias",
+        None,
+        Some("zeta_lake"),
+        Some("main")
+      )
+    )
+    val capturer = new CapturingValidator
+    val client   = new QuackHttpClient(
+      TestArrow.sharedAllocator,
+      nativeClient = true,
+      nodeDisableSsl = true
+    ):
+      override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
+        IO.pure(TestArrow.okResponse())
+    val router = new FlightSqlRouter(
+      sup,
+      new SessionRegistry,
+      new NodeLoadTracker,
+      new QuackHttpAdapter(client, new NodeLoadTracker),
+      validator = capturer
+    )
+    shapes.foreach { s =>
+      withClue(s"${s.suffix}: ") {
+        sup
+          .createTenantDb(
+            tenantName = "zeta",
+            suffix = s.suffix,
+            kind = s.kind,
+            metastore = s.metastore,
+            dataPath = s.dataPath,
+            defaultDatabase = s.defaultDatabase
+          )
+          .unsafeRunSync() shouldBe a[Right[?, ?]]
+        val key = PoolKey("zeta", s"zeta_${s.suffix}", s"p${s.suffix}")
+        sup.createPool(key, RoleDistribution(0, 0, 1)).unsafeRunSync()
+        router.execute(s"p9-${s.suffix}", "alice", key, "SELECT 1").unsafeRunSync()
+        val st = sup.get(key).get
+        capturer.lastCtx.defaultDatabase shouldBe
+          SessionCatalog.database(st.kindWire, st.metastore, st.defaultDatabase)
+        capturer.lastCtx.defaultSchema shouldBe
+          SessionCatalog.schema(st.kindWire, st.metastore, st.defaultSchema)
+        capturer.lastCtx.defaultDatabase shouldBe s.expectedDb
+        capturer.lastCtx.defaultSchema shouldBe s.expectedSchema
+      }
+    }
 
   // KNOWN GAP (ignored below): validator-vs-engine default-schema skew.
   //
