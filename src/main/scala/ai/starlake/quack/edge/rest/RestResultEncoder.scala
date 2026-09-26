@@ -96,7 +96,7 @@ object RestResultEncoder:
   // ---- CSV -----------------------------------------------------------------------------------
 
   /** RFC 4180: quote a field holding `,`, `"`, CR or LF, doubling inner quotes. */
-  private def csvField(s: String): String =
+  private[rest] def csvField(s: String): String =
     if s.exists(c => c == ',' || c == '"' || c == '\n' || c == '\r') then
       "\"" + s.replace("\"", "\"\"") + "\""
     else s
@@ -104,7 +104,7 @@ object RestResultEncoder:
   /** NULL is an empty field and an empty string a quoted empty field, so the two stay distinct;
     * scalars are their JSON text unquoted, nested values their compact JSON.
     */
-  private def csvCell(j: Json): String =
+  private[rest] def csvCell(j: Json): String =
     if j.isNull then ""
     else
       j.asString match
