@@ -37,6 +37,14 @@ EXCLUSIONS = {
     "/api/scim/v2/{tenant}/ServiceProviderConfig",
     "/api/scim/v2/{tenant}/ResourceTypes",
     "/api/scim/v2/{tenant}/Schemas",
+    # Read-only REST data edge (quack-rest): served on its own port, not the
+    # manager's, to machine-to-machine clients (low-code tools, services) with a
+    # PAT bearer. Humans read data through `qod sql` or MCP, so no CLI surface
+    # is warranted.
+    "/api/v1/tenant/{tenant}/database/{tenantDb}/schemas",
+    "/api/v1/tenant/{tenant}/database/{tenantDb}/schemas/{schema}/tables",
+    "/api/v1/tenant/{tenant}/database/{tenantDb}/schemas/{schema}/tables/{table}",
+    "/api/v1/tenant/{tenant}/database/{tenantDb}/schemas/{schema}/tables/{table}/rows",
 }
 
 OPENAPI = Path(__file__).resolve().parent / "resources" / "openapi.yaml"

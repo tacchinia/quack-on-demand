@@ -25,5 +25,8 @@ object EndpointModules:
     TimeTravelEndpoints,
     UndropEndpoints,
     RestoreEndpoints,
-    BranchEndpoints
+    BranchEndpoints,
+    // Served by the REST data edge's own listener (RestEdgeServer), never mounted by
+    // ManagerServer: registered here for the OpenAPI document only.
+    ai.starlake.quack.edge.rest.RestEdgeEndpoints
   )

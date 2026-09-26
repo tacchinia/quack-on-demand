@@ -79,7 +79,11 @@ object RestEdgeEndpoints:
     .in("api" / "v1" / "tenant" / path[String]("tenant") / "database" / path[String]("tenantDb"))
     .errorOut(statusCode.and(headers).and(jsonBody[ErrorResponse]))
     .out(headers)
-    .out(stringBody)
+    .out(
+      stringBody.description(
+        "application/json (an array of objects) or text/csv, per `format` then `Accept`; the Content-Type header says which"
+      )
+    )
     .tag(Tag)
 
   type Error = (StatusCode, List[Header], ErrorResponse)
