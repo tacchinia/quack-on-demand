@@ -178,6 +178,24 @@ and the comment above it).
 *Recommendation:* leave this unchanged and out of this feature. §7.2 at least guarantees that the
 edge closes a late result.
 
+**O-5. Findings from building the handlers (phase 1d).** Blocks: nothing unless noted.
+
+- **`deny` column policies hide the whole table.** §6.2 assumed a `deny` policy drops the column
+  from the probe's `SELECT *`. In fact `ColumnPolicyRewriter` refuses any statement that reads a
+  denied column, a star included, so the probe is refused and the table answers 404 for that
+  principal. This fails closed. Changing it is a rewriter decision, not an edge one; the edge
+  keeps it and a test pins it (the drop expectation is kept as an ignored test).
+- **Pool-permission refusals read as 404.** A handshake refused for a missing pool permission
+  surfaces through the probe as 404 `not_found`; only the PAT `pools` axis, pre-checked on the
+  resolved pool key, answers 403 `acl_denied`.
+- **Cold start can end as 504.** The default `stmtTimeoutSec` (60) equals the router's
+  `resumeHoldTimeoutSec` (60), so the edge's bound can expire before the router's 503
+  `pool_resuming`. *Recommendation:* start the edge's statement clock after the resume hold, or
+  default `stmtTimeoutSec` above the hold, and pin it with E6.
+- **Node error text in logs.** §7.1 logs node errors at WARN with the request id; that text can
+  echo literal values, in tension with T9. *Recommendation:* log the error class and the request
+  id at WARN and the full text at DEBUG.
+
 ### 2.5 SPIKES (verify in code before the dependent phase; each ends in a test that stays)
 
 All seven spikes block slice 1.
