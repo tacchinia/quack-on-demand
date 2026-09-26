@@ -24,39 +24,10 @@ import sttp.model.{Header, StatusCode}
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
 import scala.concurrent.duration.*
-import scala.jdk.CollectionConverters.*
-
-/** What the handlers read from one HTTP request: every `Authorization` value (two of them is a 401,
-  * so they are not collapsed), `Accept`, the RAW query string (see [[RestQuery.parse]] on why the
-  * edge decodes it itself) and the request id the server minted for it.
-  */
-final case class RestRequest(
-    authorization: List[String],
-    accept: Option[String],
-    rawQuery: String,
-    requestId: String
-)
-
-/** A 200: its headers (content type included) and its body, buffered (slice 1 is bounded by the row
-  * cap, §6.4).
-  */
-final case class RestOk(headers: List[Header], body: String)
-
 object RestEdgeHandlers:
 
-  /** The error side at the Tapir boundary (§13), with headers: every error still carries the
-    * caching headers, a 401 its challenge and a 503 `pool_resuming` its `Retry-After`.
-    */
-  type Failure = (StatusCode, List[Header], ErrorResponse)
+  type Failure = RestResponses.Failure
   type Out     = IO[Either[Failure, RestOk]]
-
-  /** §6.4: every response is private to its `Authorization`; only a DuckLake read pinned by `asOf`
-    * or `asOfTag` is immutable, and even that is cached briefly so a revoked grant stops being
-    * served quickly.
-    */
-  val NoCache: String     = "private, no-cache"
-  val PinnedCache: String = "private, max-age=300"
-  val RetryAfterSec: Int  = 5
 
   private val SystemSchemas = Set("information_schema", "pg_catalog")
 
@@ -120,6 +91,7 @@ final class RestEdgeHandlers(
 ) extends LazyLogging:
 
   import RestEdgeHandlers.*
+  import RestResponses.*
 
   private type Step[A] = EitherT[IO, RestError, A]
 
@@ -468,23 +440,6 @@ final class RestEdgeHandlers(
     val closed = new AtomicBoolean(false)
     IO.blocking(f(qr)).guarantee(IO.blocking(if closed.compareAndSet(false, true) then qr.close()))
 
-  /** At most `cap` rows of a listing as strings, and whether another row existed. */
-  private def readStrings(reader: ArrowReader, cap: Int): (Vector[Vector[String]], Boolean) =
-    val out  = Vector.newBuilder[Vector[String]]
-    var n    = 0
-    var more = false
-    while !more && reader.loadNextBatch() do
-      val root = reader.getVectorSchemaRoot
-      val vs   = root.getFieldVectors.asScala.toVector
-      var i    = 0
-      while i < root.getRowCount && !more do
-        if n >= cap then more = true
-        else
-          out += vs.map(v => Option(v.getObject(i)).fold("")(_.toString))
-          n += 1
-          i += 1
-    (out.result(), more)
-
   // ---- failure mapping -----------------------------------------------------------------------
 
   /** Probe and listings (§6.2): a denial, a missing object and a bad request are all the same 404,
@@ -518,51 +473,6 @@ final class RestEdgeHandlers(
       logger.warn(s"rest [$rid] upstream failure: ${other.reason}")
       RestError.UpstreamError
 
-  // ---- responses -----------------------------------------------------------------------------
-
-  private def baseHeaders(fmt: RestFormat, pinned: Boolean): List[Header] =
-    List(
-      Header("Content-Type", fmt.contentType),
-      Header("Cache-Control", if pinned then PinnedCache else NoCache),
-      Header("Vary", "Authorization")
-    )
-
-  private def csv(columns: List[String], rows: Vector[List[Json]]): String =
-    val sb = new StringBuilder
-    columns.map(RestResultEncoder.csvField).addString(sb, ",").append("\r\n")
-    rows.foreach(r => r.map(RestResultEncoder.csvCell).addString(sb, ",").append("\r\n"))
-    sb.toString
-
-  private def listing(
-      fmt: RestFormat,
-      columns: List[String],
-      rows: Vector[List[Json]],
-      more: Boolean
-  ): RestOk =
-    val body = fmt match
-      case RestFormat.Json => Json.arr(rows.map(r => Json.obj(columns.zip(r)*))*).noSpaces
-      case RestFormat.Csv  => csv(columns, rows)
-    RestOk(
-      baseHeaders(fmt, pinned = false) ++ Option.when(more)(Header("X-QoD-Truncated", "true")),
-      body
-    )
-
-  private def failure(e: RestError, rid: String): Failure =
-    val (status, body) = e.toResponse
-    // The request id lets an operator find the WARN that holds the node's text (§4.2).
-    val message =
-      if e == RestError.UpstreamError then s"${body.message} (request id $rid)"
-      else body.message
-    val extra = e match
-      case RestError.Unauthorized => List(Header("WWW-Authenticate", "Bearer"))
-      case RestError.PoolResuming => List(Header("Retry-After", RetryAfterSec.toString))
-      case _                      => Nil
-    (
-      status,
-      List(Header("Cache-Control", NoCache), Header("Vary", "Authorization")) ++ extra,
-      body.copy(message = message)
-    )
-
   /** Runs one route, turns its outcome into the boundary shape and writes the access log line: the
     * route TEMPLATE and the sanitised parameter NAMES, never a value (§7.1), since filter values
     * are often personal data.
@@ -582,9 +492,3 @@ final class RestEdgeHandlers(
       )
       result
     }
-
-  private def paramNames(raw: String): String =
-    val names = RestQuery.decodeQueryString(raw) match
-      case Right(pairs) => pairs.map(_._1)
-      case Left(_)      => raw.split("&").toVector.filter(_.nonEmpty).map(_.takeWhile(_ != '='))
-    names.map(RestError.sanitize).distinct.mkString(",")

@@ -71,7 +71,7 @@ final class RestEdgeServer(
     val withDefaults =
       List(
         Option.unless(resp.headers.get(ci"Cache-Control").isDefined)(
-          Header.Raw(ci"Cache-Control", RestEdgeHandlers.NoCache)
+          Header.Raw(ci"Cache-Control", RestResponses.NoCache)
         ),
         Option.unless(resp.headers.get(ci"Vary").isDefined)(
           Header.Raw(ci"Vary", "Authorization")
