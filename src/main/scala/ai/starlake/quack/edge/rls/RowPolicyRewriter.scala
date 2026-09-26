@@ -1,5 +1,7 @@
 package ai.starlake.quack.edge.rls
 
+import ai.starlake.quack.edge.policy.TimeTravelCarrier
+import ai.starlake.quack.edge.policy.TimeTravelCarrier.Carry
 import ai.starlake.quack.model.StatementKind
 import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import ai.starlake.quack.ondemand.state.RoleRowPolicy
@@ -150,29 +152,47 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
     else if kind != StatementKind.Select then Passthrough
     else if eff.rowPolicies.isEmpty then Passthrough
     else
-      Try(CCJSqlParserUtil.parse(sql)) match
-        case Failure(_)            => PassthroughParseFailed
-        case Success(stmt: Select) =>
-          val values  = tokenValues(eff)
-          val changed = new java.util.concurrent.atomic.AtomicBoolean(false)
-          try
-            new DeepWalker(eff, ctx, values, changed).walk(stmt)
-            if changed.get() then Rewritten(stmt.toString) else Passthrough
-          catch
-            // A predicate that fails to apply at rewrite time (should never happen - the
-            // create-time validator already parsed it) must not crash the request path, but it
-            // also must not forward the statement unfiltered: that would silently disable the
-            // row policy for the caller. Fail closed instead of Passthrough. Load-bearing for
-            // rows stored before RowPredicateValidator rejected splice-unsafe predicates (a
-            // trailing `--` comment, etc.) - see Failed's doc comment.
-            case _: Throwable =>
-              logger.warn(
-                "row policy failed to apply at rewrite time for tenant={} user={}; denying",
-                eff.user.tenant.getOrElse("-"),
-                eff.user.username
-              )
-              Failed("row policy failed to apply")
-        case Success(_) => Passthrough
+      // A time-travel clause is invisible to jsqlparser: carry it on its table reference, which
+      // maybeWrap keeps as the BASE table inside the filtered view, and put it back afterwards
+      // (TimeTravelCarrier). A Passthrough forwards the caller's original text, clause included.
+      TimeTravelCarrier.carry(sql) match
+        case Carry.Absent                    => rewriteParseable(sql, Vector.empty, eff, ctx)
+        case Carry.Unplaceable               => PassthroughParseFailed
+        case Carry.Carried(carried, clauses) => rewriteParseable(carried, clauses, eff, ctx)
+
+  private def rewriteParseable(
+      sql: String,
+      clauses: Vector[String],
+      eff: EffectiveSet,
+      ctx: SchemaContext
+  ): Outcome =
+    Try(CCJSqlParserUtil.parse(sql)) match
+      case Failure(_)            => PassthroughParseFailed
+      case Success(stmt: Select) =>
+        val values  = tokenValues(eff)
+        val changed = new java.util.concurrent.atomic.AtomicBoolean(false)
+        try
+          new DeepWalker(eff, ctx, values, changed).walk(stmt)
+          if !changed.get() then Passthrough
+          // A clause that cannot be put back would read the current data, not the snapshot.
+          else if clauses.nonEmpty && !TimeTravelCarrier.restore(stmt, clauses) then
+            PassthroughParseFailed
+          else Rewritten(stmt.toString)
+        catch
+          // A predicate that fails to apply at rewrite time (should never happen - the
+          // create-time validator already parsed it) must not crash the request path, but it
+          // also must not forward the statement unfiltered: that would silently disable the
+          // row policy for the caller. Fail closed instead of Passthrough. Load-bearing for
+          // rows stored before RowPredicateValidator rejected splice-unsafe predicates (a
+          // trailing `--` comment, etc.) - see Failed's doc comment.
+          case _: Throwable =>
+            logger.warn(
+              "row policy failed to apply at rewrite time for tenant={} user={}; denying",
+              eff.user.tenant.getOrElse("-"),
+              eff.user.username
+            )
+            Failed("row policy failed to apply")
+      case Success(_) => Passthrough
 
   // ---------- table-occurrence walk ----------
 
@@ -261,6 +281,10 @@ class RowPolicyRewriter(enabled: Boolean = true) extends LazyLogging:
       val baseTable = new Table(t.getName)
       Option(t.getSchemaName).foreach(_ => baseTable.setSchemaName(t.getSchemaName))
       Option(t.getDatabase).foreach(baseTable.setDatabase)
+      // A time-travel clause pins the BASE table: on the wrapper it would be invalid SQL, and
+      // dropping it would filter the current data instead of the snapshot.
+      baseTable.setTimeTravel(t.getTimeTravel): Unit
+      baseTable.setTimeTravelStrAfterAlias(t.getTimeTravelStrAfterAlias): Unit
 
       val inner = new PlainSelect()
       inner.addSelectItem(new AllColumns())

@@ -16,9 +16,12 @@ import org.scalatest.matchers.should.Matchers
   * (SqlParser.stripTimeTravelClauses), but ColumnPolicyRewriter and RowPolicyRewriter parse the raw
   * text, where jsqlparser rejects the clause. Both report a parse failure and the router refuses
   * the statement fail-closed: nothing leaks, but a principal holding any column or row policy on
-  * the tenant-db cannot read at a snapshot at all. The correct expectation is written below and
-  * ignored as a KNOWN GAP (ColumnPolicyRewriterSpec's precedent); the active tests pin today's
-  * refusal and show that the policies do apply to the same statements without the clause.
+  * the tenant-db cannot read at a snapshot at all.
+  *
+  * Fixed (2026-09-26) in the rewriters, per constraint 1: both strip the clause with the
+  * validator's own scanner and put it back on the same table reference (TimeTravelCarrier), inside
+  * the row-policy wrapper on the base table. A clause that cannot be pinned to a table reference
+  * still fails closed.
   */
 class RestTimeTravelPolicySpec extends AnyFlatSpec with Matchers:
 
@@ -90,28 +93,10 @@ class RestTimeTravelPolicySpec extends AnyFlatSpec with Matchers:
       rowsOf(conn, sent).map(_.head) shouldBe List("4", "3")
     }
 
-  // Characterization, active on purpose: when the rewriters learn the clause this test fails and
-  // the ignored KNOWN GAP tests below are the ones to enable.
-  "a snapshot read by a policy holder" should "currently be refused fail-closed, never forwarded unfiltered (KNOWN GAP, pinned)" in
-    statements.foreach { st =>
-      pipeline.run(st(WithAt), effWith(columnPolicies = List(maskEmail))) match
-        case Left(RouterFailure.AccessDenied(reason)) =>
-          reason should include("column policy rewrite could not parse statement")
-        case other => fail(s"expected a fail-closed CLS refusal, got $other")
-      pipeline.run(st(WithAt), effWith(rowPolicies = List(regionX))) match
-        case Left(RouterFailure.AccessDenied(reason)) =>
-          reason should include("row policy rewrite could not parse statement")
-        case other => fail(s"expected a fail-closed RLS refusal, got $other")
-    }
-
-  // KNOWN GAP (ignored below): time travel under a column or row policy.
-  //
-  // ColumnPolicyRewriter and RowPolicyRewriter hand the raw text to jsqlparser, whose grammar has
-  // no `AT (VERSION => n)` (SqlParser.stripTimeTravelClauses documents the same limit for the ACL
-  // parser, which strips the clause first). Both return a parse failure and FlightSqlRouter denies.
-  // The fix belongs in the rewriters (spec §2.2 constraint 1, §2.5 S1): they must keep the clause
-  // on the base table reference, inside the RLS wrapper, and apply the policy. Enable when fixed.
-  ignore should "keep AT (VERSION => n) on the three-part reference and still apply the column mask (KNOWN GAP, S1)" in
+  // S1, fixed in the rewriters (spec §2.2 constraint 1, §2.5 S1). Before the fix both rewriters
+  // reported a parse failure here and FlightSqlRouter refused every snapshot read by a policy
+  // holder (fail-closed, no leak).
+  "a snapshot read by a policy holder" should "keep AT (VERSION => n) on the three-part reference and still apply the column mask" in
     statements.foreach { st =>
       pipeline.run(st(WithAt), effWith(columnPolicies = List(maskEmail))) match
         case Right(sent) =>
@@ -120,9 +105,45 @@ class RestTimeTravelPolicySpec extends AnyFlatSpec with Matchers:
         case Left(f) => fail(s"expected the mask applied at the snapshot, got $f")
     }
 
-  ignore should "keep AT (VERSION => n) on the base table inside the row-policy wrapper (KNOWN GAP, S1)" in
+  it should "keep AT (VERSION => n) on the base table inside the row-policy wrapper" in
     statements.foreach { st =>
       pipeline.run(st(WithAt), effWith(rowPolicies = List(regionX))) match
         case Right(sent) => sent should include(s"FROM $Ref $At WHERE (c_region = 'X')")
         case Left(f)     => fail(s"expected the row filter applied at the snapshot, got $f")
     }
+
+  it should "keep the clause once through both rewriters stacked, the filter on the base table" in
+    statements.foreach { st =>
+      val both = effWith(columnPolicies = List(maskEmail), rowPolicies = List(regionX))
+      pipeline.run(st(WithAt), both) match
+        case Right(sent) =>
+          sent should include("'***'")
+          sent should include(s"FROM $Ref $At WHERE (c_region = 'X')")
+          sent.split(java.util.regex.Pattern.quote(At), -1).length - 1 shouldBe 1
+        case Left(f) => fail(s"expected both policies applied at the snapshot, got $f")
+    }
+
+  // In-process DuckDB has no DuckLake and cannot run AT; its BINDER refusal, rather than a parser
+  // error, is what proves the rewritten clause sits where DuckDB's grammar expects it.
+  it should "send a statement DuckDB parses" in
+    withDuckDb(kc.catalog) { conn =>
+      exec(conn, s"CREATE TABLE $Ref (c_id INTEGER, c_email VARCHAR, c_region VARCHAR)")
+      val both = effWith(columnPolicies = List(maskEmail), rowPolicies = List(regionX))
+      statements.foreach { st =>
+        val sent = pipeline.run(st(WithAt), both).fold(f => fail(f.toString), identity)
+        val err  = intercept[java.sql.SQLException](rowsOf(conn, sent))
+        err.getMessage should include("does not support time travel")
+      }
+    }
+
+  it should "still be refused fail-closed when the clause does not follow a table reference" in {
+    val derived = s"SELECT * FROM (SELECT * FROM $Ref) d $At"
+    pipeline.run(derived, effWith(columnPolicies = List(maskEmail))) match
+      case Left(RouterFailure.AccessDenied(reason)) =>
+        reason should include("column policy rewrite could not parse statement")
+      case other => fail(s"expected a fail-closed CLS refusal, got $other")
+    pipeline.run(derived, effWith(rowPolicies = List(regionX))) match
+      case Left(RouterFailure.AccessDenied(reason)) =>
+        reason should include("row policy rewrite could not parse statement")
+      case other => fail(s"expected a fail-closed RLS refusal, got $other")
+  }

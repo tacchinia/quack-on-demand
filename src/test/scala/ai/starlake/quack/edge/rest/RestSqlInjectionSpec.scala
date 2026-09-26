@@ -162,8 +162,9 @@ class RestSqlInjectionSpec extends AnyFlatSpec with Matchers:
     "TRUE",
     "FALSE",
     "LIKE",
-    "ILIKE",
-    "ESCAPE",
+    "lower",
+    "starts_with",
+    "contains",
     "CAST",
     "AS",
     "ORDER",
@@ -242,18 +243,29 @@ class RestSqlInjectionSpec extends AnyFlatSpec with Matchers:
     probe.map(_.name) shouldBe Vector("row_id", colName)
 
     val quotedItem = "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
-    // Without `*` a pattern has no wildcard, so like must behave as equality on the stripped text.
-    val stripped = s.replace("*", "")
-    val likeCase =
-      Option.when(stripped.nonEmpty)(s"like.$stripped" -> (if stripped == s then Set(1) else Set()))
+    // Without `*` a pattern has no wildcard, so like must behave as equality on the stripped text,
+    // and ilike too (rows 2 and 3 differ from it by a `~` whatever the case); edge wildcards
+    // must behave as prefix and contains. Each form is rendered as LIKE when the text holds no
+    // literal % or _, and as =, starts_with or contains otherwise (§6.3, spike S8).
+    val stripped  = s.replace("*", "")
+    val exact     = if stripped == s then Set(1) else Set.empty[Int]
+    val likeCases =
+      if stripped.isEmpty then Nil
+      else
+        List(
+          s"like.$stripped"     -> exact,
+          s"ilike.$stripped"    -> exact,
+          s"not.like.$stripped" -> (Set(1, 2, 3) -- exact)
+        ) ++ Option
+          .when(stripped == s)(List(s"like.$s*" -> Set(1, 2), s"like.*$s*" -> Set(1, 2, 3)))
+          .getOrElse(Nil)
     val cases = List(
       s"eq.$s"                -> Set(1),
       s"not.eq.$s"            -> Set(2, 3),
       s"in.($quotedItem)"     -> Set(1),
       s"not.in.($quotedItem)" -> Set(2, 3)
-    ) ++ likeCase
-    val likeLit  = stripped.flatMap(c => if "%_\\".contains(c) then s"\\$c" else c.toString)
-    val literals = Set(s, likeLit, "\\")
+    ) ++ likeCases
+    val literals = Set(s, stripped, stripped + "%", "%" + stripped + "%")
     for (value, expected) <- cases do
       val sql = RestQuery
         .parse(Seq("select" -> "row_id", colName -> value))

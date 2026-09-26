@@ -83,7 +83,15 @@ object RestSql:
       case Predicate.Compare(cmp, raw) => negate(s"$col ${cmp.sql} ${cast(raw, f.column)}")
       case Predicate.Items(items)      =>
         negate(items.map(cast(_, f.column)).mkString(s"$col IN (", ", ", ")"))
-      case Predicate.Pattern(ci, pattern, escaped) =>
-        val kw  = if ci then "ILIKE" else "LIKE"
-        val esc = if escaped then s" ESCAPE ${lit("\\")}" else ""
-        negate(s"$col $kw CAST(${lit(pattern)} AS VARCHAR)$esc")
+      case Predicate.Pattern(ci, form, text) =>
+        // ilike folds both sides with lower() rather than ILIKE, which always runs DuckDB's
+        // backtracking matcher (spike S8); PatternForm records why the result is the same.
+        val subject = if ci then s"lower($col)" else col
+        val needle  =
+          if ci then s"lower(CAST(${lit(text)} AS VARCHAR))" else s"CAST(${lit(text)} AS VARCHAR)"
+        negate(form match
+          case PatternForm.Like       => s"$subject LIKE $needle"
+          case PatternForm.Equals     => s"$subject = $needle"
+          case PatternForm.StartsWith => s"starts_with($subject, $needle)"
+          case PatternForm.EndsWith   => s"ends_with($subject, $needle)"
+          case PatternForm.Contains   => s"contains($subject, $needle)")
