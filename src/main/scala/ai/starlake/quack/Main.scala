@@ -1478,47 +1478,11 @@ object Main extends IOApp with LazyLogging:
                   eff.map(e =>
                     ai.starlake.quack.ondemand.rbac.Attenuation.attenuatedBy(e, caller.restriction)
                   )
-              val run = fsRouter.execute(
-                caller.connectionId,
-                caller.identity,
-                poolKey,
-                sql,
-                effectiveSet = narrowed,
-                recordExecution = recordExecution,
-                patId = caller.patId,
-                // This closure is the single choke point every PreviewExecutor caller shares
-                // (preview, data diff, restore, undrop, AND the MCP run_sql / describe_table
-                // tools per the comment above). PAT attenuation narrows `narrowed` but the
-                // SQL admin dialect's own authorization does not know about that ceiling, so
-                // a claimed admin statement reaching this path must stay on the pre-dialect
-                // routed path (fail-closed denial or normal ACL, unchanged) rather than the
-                // dialect's superuser/tenant-admin check.
-                adminDispatch = false
-              )
-              // BOUNDED WAIT, not a cancellation: past this many milliseconds the
-              // caller of this executor gets a failure back, but the underlying
-              // IO.blocking node call keeps running unobserved and may still
-              // complete -- the same caveat as previewTimeoutSec above, and the
-              // same best-effort gap FlightSqlRouter already has between register
-              // and attachCancel. Durable cancellation (bracketing the connection
-              // inside QuackHttpClient) is deliberately deferred to a later
-              // sub-project; do not describe this branch as killing or aborting
-              // the statement.
-              caller.restriction.stmtTimeoutMs match
-                case Some(ms) if ms > 0 =>
-                  run.timeoutTo(
-                    scala.concurrent.duration.FiniteDuration(
-                      ms.toLong,
-                      java.util.concurrent.TimeUnit.MILLISECONDS
-                    ),
-                    IO.pure(
-                      Left(
-                        ai.starlake.quack.edge.RouterFailure
-                          .Unavailable(s"statement exceeded this token's ${ms}ms limit")
-                      )
-                    )
-                  )
-                case _ => run
+              // Forwards the caller's patId, source and preferredNode, keeps the admin
+              // dialect off this path and applies the token's own timeout: see
+              // RoutedExecution for why each of those holds.
+              ai.starlake.quack.ondemand.api.RoutedExecution
+                .run(fsRouter, caller, poolKey, sql, narrowed, recordExecution)
           }
 
       val previewExecutor: ai.starlake.quack.ondemand.api.CatalogPreviewHandlers.PreviewExecutor =

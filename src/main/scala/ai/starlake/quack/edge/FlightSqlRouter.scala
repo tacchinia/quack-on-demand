@@ -322,14 +322,19 @@ final class FlightSqlRouter(
         */
       patId: Option[String] = None,
       /** Gate on top of `adminExecutor` being wired: TAIL param, defaulted `true` so the raw
-        * FlightSQL wire (every `FlightProducerImpl` call site) is unaffected. `Main` sets this
-        * `false` on the single `fsRouter.execute` call backing `PreviewExecutor` (preview, data
+        * FlightSQL wire (every `FlightProducerImpl` call site) is unaffected. `RoutedExecution`
+        * sets this `false` on the single `execute` call backing `PreviewExecutor` (preview, data
         * diff, restore, undrop, and the MCP `run_sql`/`describe_table` tools all route through that
         * one closure) so a claimed admin statement reaching it still takes the pre-dialect routed
         * path instead of the dialect's authorization, which does not account for PAT attenuation
         * the way the routed ACL path does.
         */
-      adminDispatch: Boolean = true
+      adminDispatch: Boolean = true,
+      /** The audit origin and `SessionOpened` channel, forwarded to [[executeWith]]. TAIL param,
+        * defaulted to the raw FlightSQL wire's value so every existing call site is unaffected; the
+        * routed executor passes its caller's (`"rest"` for the REST edge).
+        */
+      source: String = "flightsql"
   ): IO[Either[RouterFailure, QueryResult]] =
     adminExecutor match
       case Some(exec) if adminDispatch && ai.starlake.quack.edge.admin.AdminSqlParser.claims(sql) =>
@@ -360,7 +365,7 @@ final class FlightSqlRouter(
           sql,
           effectiveSet,
           adapterSend,
-          source = "flightsql",
+          source = source,
           preferredNode = preferredNode,
           recordExecution = recordExecution,
           prepareDurationMs = prepareDurationMs,
@@ -388,7 +393,7 @@ final class FlightSqlRouter(
     * through [[execute]].
     *
     * `source` is the audit origin recorded on denial and write events and on the SessionOpened
-    * module event (`"flightsql"` or `"quack"`).
+    * module event (`"flightsql"`, `"quack"` or `"rest"`).
     */
   def executeWith[A](
       connectionId: String,

@@ -16,6 +16,13 @@ class ExecCallerSpec extends AnyFlatSpec with Matchers:
     c.restriction shouldBe TokenRestriction.Unrestricted
   }
 
+  it should "default to the FlightSQL source and no preferred node" in {
+    // Every call site that predates the REST edge keeps today's audit origin and routing.
+    val c = ExecCaller.unrestricted("conn-1", "alice")
+    c.source shouldBe "flightsql"
+    c.preferredNode shouldBe None
+  }
+
   "effectiveMaxRows" should "take the smallest of the server cap, the token cap and the request" in {
     val capped = ExecCaller
       .unrestricted("c", "u")
