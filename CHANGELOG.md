@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.9.7
+
+- **A read-only REST data edge serves tables and views as HTTP resources (#120).** HTTP-only tools
+  (n8n, Zapier, a spreadsheet import, a cache) can now read governed data without a driver or SQL.
+  `QOD_REST_ENABLED=true` opens a fifth listener on `:31339` (`QOD_REST_PORT`, TLS on by default
+  and reusing the FlightSQL edge's PEM pair, `QOD_REST_TLS_ENABLED`) with four `GET` endpoints under
+  `/api/v1/tenant/{tenant}/database/{db}`: `/schemas`, `/schemas/{s}/tables`,
+  `/schemas/{s}/tables/{t}` and `/schemas/{s}/tables/{t}/rows`, answering JSON (an array of
+  objects, exact decimals) or CSV (RFC 4180) by `format=` or `Accept`. `/rows` takes `select`,
+  column filters (`eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `in`, `is`, each
+  negatable with `not.`), `order`, `limit`/`offset` and, on DuckLake, `asOf`/`asOfTag`/`asOfTs`;
+  every DuckLake page carries `X-QoD-Snapshot`, and sending it back as `asOf` keeps paging stable
+  under concurrent writes. Each request becomes one `SELECT` through the same routed executor as
+  MCP `run_sql`, so grants, row and column policies, pool permissions, audit (origin `rest`),
+  statement history and metering apply unchanged; an object the caller may not read answers the
+  same `404` as a missing one. Credentials are personal access tokens only (never the static API
+  key, a cookie or a password; a superuser token is refused): a token with no `tools` restriction
+  may use the edge, and one restricted with `qod auth pat create --tool ...` must list the reserved
+  name `rest`. Rows are capped by `min(limit or QOD_REST_DEFAULT_LIMIT, QOD_REST_MAX_ROWS, the
+  token's maxRows)` with `X-QoD-Truncated` when a server or token cap cut the page, and each
+  statement is bounded by `QOD_REST_STMT_TIMEOUT_SEC` (504) and a hibernated pool answers `503
+  pool_resuming` with `Retry-After`. Responses are `Cache-Control: private` with `Vary:
+  Authorization`, and cacheable for five minutes only when pinned to a snapshot. The Helm chart
+  gains `rest.enabled` (off by default), `rest.tls.enabled`, a `<release>-rest` Service
+  (`service.restData`) and its NetworkPolicy port; the image exposes `31339`. There is no per-client
+  rate limit yet: an internet-facing edge must sit behind a reverse proxy or WAF that rate-limits
+  per client and per `Authorization` value.
+
 ## 0.9.6
 
 - **`ATTACH ... (TYPE quack)` now works for users holding column policies, and their masks hold on
