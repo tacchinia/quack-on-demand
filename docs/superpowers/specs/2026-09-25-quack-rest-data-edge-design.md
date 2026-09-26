@@ -196,6 +196,20 @@ edge closes a late result.
   echo literal values, in tension with T9. *Recommendation:* log the error class and the request
   id at WARN and the full text at DEBUG.
 
+**O-6. Findings from the end-to-end spec (phase 1e).** Blocks: nothing unless noted.
+
+- **Cold-start race in the router (every door).** `resumePool` returns once the local backend has
+  launched the node process, and a node counts as routable before `quack_serve` listens
+  (`NodeLoad.healthy` defaults to true). The hold poll then ends at once, the statement meets
+  "connection refused" (Transient), and `retryOnce` has no other node, so E6(a) is expected to end
+  in 503 `pool_unavailable` rather than 200 on a workstation. *Recommendation:* the router's hold
+  waits for a node that has answered its health probe. Fix in the router, not the edge.
+- **Audit origin `rest` is overloaded.** `AuditEvent.origin` documents `"rest"` as the management
+  REST API; REST data edge events are told apart only by family (`data-denial`, `data-write`).
+  *Recommendation:* a distinct origin such as `rest-data` (maintainer call; one constant).
+- **The end-to-end spec re-creates `routedExecutor`'s tenant branch**, because the executor is a
+  closure inside `Main`. Extracting it into a class would let the spec use the production code.
+
 ### 2.5 SPIKES (verify in code before the dependent phase; each ends in a test that stays)
 
 All seven spikes block slice 1.
