@@ -222,3 +222,14 @@ class McpProtocolSpec extends AnyFlatSpec with Matchers:
     result.downField("content").downN(0).get[String]("text").toOption.getOrElse("") should
       include("retry in a few seconds")
   }
+
+  "the tool registry" should "refuse a tool named after a reserved PAT tool name such as rest" in {
+    // `rest` is the REST data edge's name on the PAT tools axis (quack-rest design Q2, §5 step 5):
+    // an MCP tool of that name would make one allowlist entry admit two different surfaces.
+    TokenRestriction.ReservedToolNames should contain("rest")
+    val restTool = echoTool.copy(name = "rest")
+    val thrown   = intercept[IllegalArgumentException] {
+      new McpRoutes(McpConfig(), Some("sk"), resolvePat, List(echoTool, restTool), "test")
+    }
+    thrown.getMessage should include("rest")
+  }
