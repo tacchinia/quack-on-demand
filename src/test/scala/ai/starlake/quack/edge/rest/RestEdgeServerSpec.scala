@@ -56,7 +56,8 @@ class RestEdgeServerSpec extends AnyFlatSpec with Matchers:
         "rawQuery"  -> Json.fromString(req.rawQuery),
         "requestId" -> Json.fromString(req.requestId),
         "auth"      -> Json.fromInt(req.authorization.size),
-        "accept"    -> req.accept.fold(Json.Null)(Json.fromString)
+        "accept"    -> req.accept.fold(Json.Null)(Json.fromString),
+        "client"    -> Json.fromString(req.client)
       )
       IO.pure(Right((List(Header("Content-Type", "application/json")), body.noSpaces)))
     },
@@ -262,6 +263,26 @@ class RestEdgeServerSpec extends AnyFlatSpec with Matchers:
       resp.headers().firstValue("strict-transport-security").orElse("") should include("max-age=")
     }
   }
+
+  // ---- O-1: the client key, on the wire (§7.3) ----------------------
+
+  private def clientOf(resp: HttpResponse[String]): String =
+    io.circe.parser.parse(resp.body()).toOption.get.hcursor.get[String]("client").toOption.get
+
+  "the client key" should "be the TCP peer, ignoring X-Forwarded-For from an untrusted peer" in
+    withServer(cfg(freePort())) { base =>
+      clientOf(get(s"$base$RowsPath", "X-Forwarded-For" -> "203.0.113.5")) shouldBe "127.0.0.1"
+      clientOf(get(s"$base$RowsPath")) shouldBe "127.0.0.1"
+    }
+
+  it should "be the right-most untrusted X-Forwarded-For hop behind a trusted proxy" in
+    withServer(cfg(freePort()).copy(trustedProxies = "127.0.0.1/32")) { base =>
+      clientOf(get(s"$base$RowsPath", "X-Forwarded-For" -> "203.0.113.5")) shouldBe "203.0.113.5"
+      clientOf(
+        get(s"$base$RowsPath", "X-Forwarded-For" -> "203.0.113.5, 198.51.100.1")
+      ) shouldBe "198.51.100.1"
+      clientOf(get(s"$base$RowsPath", "X-Forwarded-For" -> "garbage")) shouldBe "127.0.0.1"
+    }
 
   extension [A](o: java.util.Optional[A])
     private def toScala: Option[A] = if o.isPresent then Some(o.get) else None

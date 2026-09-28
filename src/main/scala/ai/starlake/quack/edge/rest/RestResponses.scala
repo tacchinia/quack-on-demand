@@ -9,13 +9,15 @@ import scala.jdk.CollectionConverters.*
 
 /** What the handlers read from one HTTP request: every `Authorization` value (two of them is a 401,
   * so they are not collapsed), `Accept`, the RAW query string (see [[RestQuery.parse]] on why the
-  * edge decodes it itself) and the request id the server minted for it.
+  * edge decodes it itself), the request id the server minted for it and the client key the server
+  * resolved for the failed-auth throttle ([[ClientAddress]]).
   */
 final case class RestRequest(
     authorization: List[String],
     accept: Option[String],
     rawQuery: String,
-    requestId: String
+    requestId: String,
+    client: String = ClientAddress.Unknown
 )
 
 /** A 200: its headers (content type included) and its body, buffered (slice 1 is bounded by the row

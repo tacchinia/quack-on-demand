@@ -43,7 +43,10 @@ import scala.util.Try
   *   - a fresh `X-Request-Id` per request, set on the request the handlers read (a client's own is
   *     replaced, never echoed) and on every response, including the ones Ember itself generates for
   *     an unparseable or oversized request head;
-  *   - the security headers of §7.1 and the default caching headers of §6.4 on every response.
+  *   - the security headers of §7.1 and the default caching headers of §6.4 on every response;
+  *   - the client key of the failed-auth throttle (§7.3), resolved from the TCP peer and, only
+  *     behind `trustedProxies`, `X-Forwarded-For`, then handed to the handlers as a request
+  *     attribute.
   */
 final class RestEdgeServer(
     cfg: RestEdgeConfig,
@@ -52,6 +55,8 @@ final class RestEdgeServer(
 ) extends LazyLogging:
 
   import RestEdgeServer.*
+
+  private val trustedProxies = cfg.trustedProxyCidrs
 
   private val tapirRoutes: HttpRoutes[IO] = Http4sServerInterpreter[IO]().toRoutes(endpoints)
 
@@ -105,12 +110,26 @@ final class RestEdgeServer(
           .putHeaders(Connection.close)
       )
 
+  /** The throttle key of a request (§7.3): the TCP peer, or behind a trusted proxy the right-most
+    * untrusted `X-Forwarded-For` hop ([[ClientAddress]]).
+    */
+  private def clientOf(req: Request[IO]): String =
+    ClientAddress.keyOf(
+      req.remote.map(_.host.toInetAddress),
+      req.headers.get(ci"X-Forwarded-For").fold(Nil)(_.toList.map(_.value)),
+      trustedProxies
+    )
+
   /** The whole app: request id, gates, routes, headers; an escaped error is a decorated 500. */
   val app: HttpApp[IO] = Kleisli { (req0: Request[IO]) =>
     val rid    = newRequestId()
+    val client = clientOf(req0)
     val accept = req0.headers.get(ci"Accept").map(_.toList.map(_.value).mkString(","))
     // `putHeaders` replaces: a client's own X-Request-Id never reaches the handlers.
-    val base   = req0.removeHeader(ci"Accept").putHeaders(Header.Raw(ci"X-Request-Id", rid))
+    val base = req0
+      .removeHeader(ci"Accept")
+      .putHeaders(Header.Raw(ci"X-Request-Id", rid))
+      .withAttribute(RestEdgeEndpoints.ClientAttribute, client)
     val req    = accept.fold(base)(a => base.withAttribute(RestEdgeEndpoints.AcceptAttribute, a))
     val routed = gate(req) match
       case Some(refused) => IO.pure(refused)

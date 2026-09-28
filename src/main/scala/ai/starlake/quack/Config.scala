@@ -1164,8 +1164,21 @@ final case class RestEdgeConfig(
       envVar = "QOD_REST_IDLE_TIMEOUT_SEC",
       description = "Seconds an idle keep-alive connection stays open."
     )
-    idleTimeoutSec: Int
-)
+    idleTimeoutSec: Int,
+    // ---- O-1 abuse controls (§7.3).
+    @field @ConfigField(
+      envVar = "QOD_REST_TRUSTED_PROXIES",
+      description =
+        "Comma-separated CIDRs (IPv4 or IPv6) of proxies / load balancers whose X-Forwarded-For " +
+          "is believed when keying the failed-auth throttle, walked from the right. Empty = " +
+          "believe none: the key is the TCP peer."
+    )
+    trustedProxies: String = ""
+):
+  // `def`, not a val: ConfigRegistry pairs declared fields with constructor parameters by position.
+  /** The parsed `trustedProxies`; empty (trust none) when it does not parse, which boot refuses. */
+  def trustedProxyCidrs: List[Cidr] =
+    FleetConfig.parseCidrs("QOD_REST_TRUSTED_PROXIES", trustedProxies).getOrElse(Nil)
 
 object RestEdgeConfig:
 
@@ -1194,6 +1207,7 @@ object RestEdgeConfig:
         atLeast(cfg.maxHeaderBytes, 1024, "QOD_REST_MAX_HEADER_BYTES"),
         atLeast(cfg.headerReceiveTimeoutSec, 1, "QOD_REST_HEADER_RECEIVE_TIMEOUT_SEC"),
         atLeast(cfg.idleTimeoutSec, 1, "QOD_REST_IDLE_TIMEOUT_SEC"),
+        FleetConfig.parseCidrs("QOD_REST_TRUSTED_PROXIES", cfg.trustedProxies).left.toOption,
         otherPorts.collectFirst {
           case (door, p) if p == cfg.port =>
             s"QOD_REST_PORT ${cfg.port} is already bound by the $door listener"

@@ -32,6 +32,21 @@ class RestEdgeConfigSpec extends AnyFlatSpec with Matchers:
     defaults.idleTimeoutSec shouldBe 60
   }
 
+  it should "trust no proxy by default" in {
+    defaults.trustedProxies shouldBe ""
+    defaults.trustedProxyCidrs shouldBe Nil
+  }
+
+  it should "parse trustedProxies as IPv4 and IPv6 CIDRs" in {
+    val cfg = ConfigSource
+      .string("""quack-rest { trustedProxies = "10.0.0.0/8, fd00::/8,192.168.1.1" }""")
+      .withFallback(ConfigSource.default)
+      .at("quack-rest")
+      .loadOrThrow[RestEdgeConfig]
+    cfg.trustedProxyCidrs.map(_.toString) shouldBe List("10.0.0.0/8", "fd00::/8", "192.168.1.1")
+    RestEdgeConfig.validate(cfg.copy(enabled = true), others) shouldBe Right(())
+  }
+
   it should "read camelCase overrides through the Main ProductHint" in {
     val cfg = ConfigSource
       .string("quack-rest { enabled = true, port = 40000, maxRows = 50, defaultLimit = 10 }")
@@ -69,6 +84,17 @@ class RestEdgeConfigSpec extends AnyFlatSpec with Matchers:
       }
     }
   }
+
+  it should "refuse an unparsable trusted proxy, naming its env var" in
+    List("10.0.0.0/33", "not-a-cidr", "10.0.0.0/8, example.com", "fd00::/129").foreach { raw =>
+      withClue(raw) {
+        RestEdgeConfig
+          .validate(defaults.copy(enabled = true, trustedProxies = raw), others)
+          .left
+          .toOption
+          .getOrElse("") should include("QOD_REST_TRUSTED_PROXIES")
+      }
+    }
 
   it should "refuse a port another door already binds" in {
     val msg = RestEdgeConfig
