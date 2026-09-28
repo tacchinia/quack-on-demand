@@ -46,17 +46,20 @@ import scala.util.Try
   *   - the security headers of §7.1 and the default caching headers of §6.4 on every response;
   *   - the client key of the failed-auth throttle (§7.3), resolved from the TCP peer and, only
   *     behind `trustedProxies`, `X-Forwarded-For`, then handed to the handlers as a request
-  *     attribute.
+  *     attribute; and the 429 a blocked client gets on every request, ahead of all of the above.
   */
 final class RestEdgeServer(
     cfg: RestEdgeConfig,
     endpoints: List[ServerEndpoint[Any, IO]],
-    newRequestId: () => String = () => UUID.randomUUID().toString
+    newRequestId: () => String = () => UUID.randomUUID().toString,
+    /** The failed-auth throttle (§7.3), the SAME instance the handlers record failures in. */
+    throttle: Option[AuthThrottle] = None
 ) extends LazyLogging:
 
   import RestEdgeServer.*
 
-  private val trustedProxies = cfg.trustedProxyCidrs
+  private val authThrottle: AuthThrottle = throttle.getOrElse(AuthThrottle(cfg, _ => ()))
+  private val trustedProxies             = cfg.trustedProxyCidrs
 
   private val tapirRoutes: HttpRoutes[IO] = Http4sServerInterpreter[IO]().toRoutes(endpoints)
 
@@ -120,6 +123,17 @@ final class RestEdgeServer(
       trustedProxies
     )
 
+  /** §7.3: a client blocked for failed authentication gets 429 on EVERY request, whatever its path
+    * or method, before anything else is looked at. The handlers check again (they are also
+    * reachable without this shell); this gate also covers what never reaches them.
+    */
+  private def blocked(client: String): Option[Response[IO]] =
+    authThrottle.blockedFor(client).map { left =>
+      val e = RestError.TooManyAuthFailures(left)
+      error(Status.TooManyRequests, e.code, e.message)
+        .putHeaders(Header.Raw(ci"Retry-After", left.toString))
+    }
+
   /** The whole app: request id, gates, routes, headers; an escaped error is a decorated 500. */
   val app: HttpApp[IO] = Kleisli { (req0: Request[IO]) =>
     val rid    = newRequestId()
@@ -131,7 +145,7 @@ final class RestEdgeServer(
       .putHeaders(Header.Raw(ci"X-Request-Id", rid))
       .withAttribute(RestEdgeEndpoints.ClientAttribute, client)
     val req    = accept.fold(base)(a => base.withAttribute(RestEdgeEndpoints.AcceptAttribute, a))
-    val routed = gate(req) match
+    val routed = blocked(client).orElse(gate(req)) match
       case Some(refused) => IO.pure(refused)
       case None          => (tapirRoutes <+> notFound).orNotFound.run(req)
     routed

@@ -1165,7 +1165,7 @@ final case class RestEdgeConfig(
       description = "Seconds an idle keep-alive connection stays open."
     )
     idleTimeoutSec: Int,
-    // ---- O-1 abuse controls (§7.3).
+    // ---- O-1 abuse controls (§7.3). Per replica: under HA the effective budget is N times these.
     @field @ConfigField(
       envVar = "QOD_REST_TRUSTED_PROXIES",
       description =
@@ -1173,7 +1173,37 @@ final case class RestEdgeConfig(
           "is believed when keying the failed-auth throttle, walked from the right. Empty = " +
           "believe none: the key is the TCP peer."
     )
-    trustedProxies: String = ""
+    trustedProxies: String = "",
+    @field @ConfigField(
+      envVar = "QOD_REST_AUTH_FAILURES_PER_WINDOW",
+      description =
+        "Failed authentications a client address may make within the window; one more blocks it."
+    )
+    authFailuresPerWindow: Int = 20,
+    @field @ConfigField(
+      envVar = "QOD_REST_AUTH_WINDOW_SEC",
+      description = "Sliding window, in seconds, over which failed authentications are counted."
+    )
+    authWindowSec: Int = 60,
+    @field @ConfigField(
+      envVar = "QOD_REST_AUTH_BLOCK_SEC",
+      description =
+        "Seconds a blocked client address gets 429 on every request, before any credential lookup."
+    )
+    authBlockSec: Int = 300,
+    @field @ConfigField(
+      envVar = "QOD_REST_AUTH_FAILURES_GLOBAL_PER_SEC",
+      description =
+        "Edge-wide budget of failed credential verifications per second; past it a failing " +
+          "credential gets 429 instead of 401 (valid credentials are unaffected)."
+    )
+    authFailuresGlobalPerSec: Int = 50,
+    @field @ConfigField(
+      envVar = "QOD_REST_AUTH_THROTTLE_MAX_ENTRIES",
+      description =
+        "Client addresses the failed-auth throttle tracks (counters and, separately, blocks)."
+    )
+    authThrottleMaxEntries: Int = 100000
 ):
   // `def`, not a val: ConfigRegistry pairs declared fields with constructor parameters by position.
   /** The parsed `trustedProxies`; empty (trust none) when it does not parse, which boot refuses. */
@@ -1208,6 +1238,11 @@ object RestEdgeConfig:
         atLeast(cfg.headerReceiveTimeoutSec, 1, "QOD_REST_HEADER_RECEIVE_TIMEOUT_SEC"),
         atLeast(cfg.idleTimeoutSec, 1, "QOD_REST_IDLE_TIMEOUT_SEC"),
         FleetConfig.parseCidrs("QOD_REST_TRUSTED_PROXIES", cfg.trustedProxies).left.toOption,
+        atLeast(cfg.authFailuresPerWindow, 1, "QOD_REST_AUTH_FAILURES_PER_WINDOW"),
+        atLeast(cfg.authWindowSec, 1, "QOD_REST_AUTH_WINDOW_SEC"),
+        atLeast(cfg.authBlockSec, 1, "QOD_REST_AUTH_BLOCK_SEC"),
+        atLeast(cfg.authFailuresGlobalPerSec, 1, "QOD_REST_AUTH_FAILURES_GLOBAL_PER_SEC"),
+        atLeast(cfg.authThrottleMaxEntries, 1, "QOD_REST_AUTH_THROTTLE_MAX_ENTRIES"),
         otherPorts.collectFirst {
           case (door, p) if p == cfg.port =>
             s"QOD_REST_PORT ${cfg.port} is already bound by the $door listener"

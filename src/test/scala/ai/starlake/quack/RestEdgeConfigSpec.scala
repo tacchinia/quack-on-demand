@@ -32,9 +32,14 @@ class RestEdgeConfigSpec extends AnyFlatSpec with Matchers:
     defaults.idleTimeoutSec shouldBe 60
   }
 
-  it should "trust no proxy by default" in {
+  it should "ship the O-1 abuse controls with their documented defaults" in {
     defaults.trustedProxies shouldBe ""
     defaults.trustedProxyCidrs shouldBe Nil
+    defaults.authFailuresPerWindow shouldBe 20
+    defaults.authWindowSec shouldBe 60
+    defaults.authBlockSec shouldBe 300
+    defaults.authFailuresGlobalPerSec shouldBe 50
+    defaults.authThrottleMaxEntries shouldBe 100000
   }
 
   it should "parse trustedProxies as IPv4 and IPv6 CIDRs" in {
@@ -68,15 +73,20 @@ class RestEdgeConfigSpec extends AnyFlatSpec with Matchers:
   it should "refuse each out-of-range number, naming its env var" in {
     val on    = defaults.copy(enabled = true)
     val cases = List(
-      on.copy(port = 0)                    -> "QOD_REST_PORT",
-      on.copy(port = 65536)                -> "QOD_REST_PORT",
-      on.copy(defaultLimit = 0)            -> "QOD_REST_DEFAULT_LIMIT",
-      on.copy(maxRows = 999)               -> "QOD_REST_MAX_ROWS",
-      on.copy(stmtTimeoutSec = 0)          -> "QOD_REST_STMT_TIMEOUT_SEC",
-      on.copy(maxConnections = 0)          -> "QOD_REST_MAX_CONNECTIONS",
-      on.copy(maxHeaderBytes = 1023)       -> "QOD_REST_MAX_HEADER_BYTES",
-      on.copy(headerReceiveTimeoutSec = 0) -> "QOD_REST_HEADER_RECEIVE_TIMEOUT_SEC",
-      on.copy(idleTimeoutSec = 0)          -> "QOD_REST_IDLE_TIMEOUT_SEC"
+      on.copy(port = 0)                     -> "QOD_REST_PORT",
+      on.copy(port = 65536)                 -> "QOD_REST_PORT",
+      on.copy(defaultLimit = 0)             -> "QOD_REST_DEFAULT_LIMIT",
+      on.copy(maxRows = 999)                -> "QOD_REST_MAX_ROWS",
+      on.copy(stmtTimeoutSec = 0)           -> "QOD_REST_STMT_TIMEOUT_SEC",
+      on.copy(maxConnections = 0)           -> "QOD_REST_MAX_CONNECTIONS",
+      on.copy(maxHeaderBytes = 1023)        -> "QOD_REST_MAX_HEADER_BYTES",
+      on.copy(headerReceiveTimeoutSec = 0)  -> "QOD_REST_HEADER_RECEIVE_TIMEOUT_SEC",
+      on.copy(idleTimeoutSec = 0)           -> "QOD_REST_IDLE_TIMEOUT_SEC",
+      on.copy(authFailuresPerWindow = 0)    -> "QOD_REST_AUTH_FAILURES_PER_WINDOW",
+      on.copy(authWindowSec = 0)            -> "QOD_REST_AUTH_WINDOW_SEC",
+      on.copy(authBlockSec = -1)            -> "QOD_REST_AUTH_BLOCK_SEC",
+      on.copy(authFailuresGlobalPerSec = 0) -> "QOD_REST_AUTH_FAILURES_GLOBAL_PER_SEC",
+      on.copy(authThrottleMaxEntries = 0)   -> "QOD_REST_AUTH_THROTTLE_MAX_ENTRIES"
     )
     cases.foreach { case (cfg, env) =>
       withClue(env) {

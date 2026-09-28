@@ -68,6 +68,9 @@ object RestEdgeHandlers:
   * statement is text from [[RestSql]] and goes through that executor exactly as MCP `run_sql` does,
   * so the validator and the rewriters see an ordinary SELECT.
   *
+  * An HTTP-layer resource control (§7.3, O-1) wraps step 2 without touching the pipeline: the
+  * failed-auth throttle ([[AuthThrottle]], keyed by the client address).
+  *
   * Ordering, settled here because §4.1 needs `pool`, `format` and `asOf*` BEFORE the probe while
   * `reserved_column` (Q6) is only decidable AFTER it: on `/rows`, a reserved parameter whose value
   * is filter-shaped (`format=eq.csv`) may be a mis-aimed filter on a column of that name. When such
@@ -87,8 +90,13 @@ final class RestEdgeHandlers(
     catalogReader: (String, String) => DuckLakeCatalogReader,
     tagSnapshot: (String, String, String) => Option[Long],
     /** Overrides `cfg.stmtTimeoutSec` (the H8 seam); a token's `stmtTimeoutMs` still lowers it. */
-    stmtTimeout: Option[FiniteDuration] = None
+    stmtTimeout: Option[FiniteDuration] = None,
+    /** The failed-auth throttle (§7.3), shared with [[RestEdgeServer]] in production. */
+    throttle: Option[AuthThrottle] = None
 ) extends LazyLogging:
+
+  // Built from `cfg` when not given: a default parameter cannot refer to another one here.
+  private val authThrottle: AuthThrottle = throttle.getOrElse(AuthThrottle(cfg, _ => ()))
 
   import RestEdgeHandlers.*
   import RestResponses.*
@@ -217,11 +225,29 @@ final class RestEdgeHandlers(
 
   // ---- step 2: authentication ----------------------------------------------------------------
 
+  /** A blocked client is answered 429 FIRST, before the header is parsed or the PAT store is asked
+    * (§7.3): that lookup is the load the throttle exists to shed. Every authentication failure then
+    * counts against the client, and a failed verification also spends the global budget.
+    */
   private def authenticate(tenant: String, req: RestRequest): Step[PatPrincipal] =
+    val blocked = authThrottle.blockedFor(req.client).map(RestError.TooManyAuthFailures(_))
     for
+      _ <- lift(blocked.toLeft(()))
       p <- EitherT(IO.blocking(RestAuth.authenticate(req.authorization, resolvePat)))
-      _ <- lift(RestAuth.admit(p, tenant))
+        .leftMap(authFailure(req.client))
+      _ <- lift(RestAuth.admit(p, tenant).left.map(authFailure(req.client)))
     yield p
+
+  /** Counts `e` against `client` when it is an authentication failure ([[AuthThrottle.counts]]).
+    * The failure that crosses the allowance is itself answered 429, and so is a 401 past the global
+    * budget. A success is never recorded, so it resets nothing.
+    */
+  private def authFailure(client: String)(e: RestError): RestError =
+    if !AuthThrottle.counts(e) then e
+    else if authThrottle.recordFailure(client) then RestError.TooManyAuthFailures(cfg.authBlockSec)
+    else if e == RestError.Unauthorized && !authThrottle.tryGlobal() then
+      RestError.TooManyAuthFailures(1)
+    else e
 
   // ---- path segments and parameters ----------------------------------------------------------
 
