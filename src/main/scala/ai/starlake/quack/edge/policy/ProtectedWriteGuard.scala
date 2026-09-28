@@ -2,6 +2,7 @@ package ai.starlake.quack.edge.policy
 
 import ai.starlake.acl.model.{Config, TableRef}
 import ai.starlake.acl.parser.{SqlParser, StatementResult, Verb}
+import ai.starlake.quack.edge.sql.CatalogReachingCalls
 import ai.starlake.quack.edge.cls.{
   ColumnCatalog,
   ColumnPolicyRewriter,
@@ -29,7 +30,9 @@ enum GuardOutcome:
   * non-SELECT statement from a principal with enforced policies, denies when the read side exposes
   * a protected table: any read of an RLS table, or a CLS table whose masked columns actually appear
   * in the read. Any read it cannot isolate denies fail-closed. Never rewrites; only allows or
-  * denies.
+  * denies. On EVERY statement kind, a plain SELECT included, it also denies a
+  * [[CatalogReachingCalls]] call (`query_table('t')`, `query('...')`): the rewriters cannot see a
+  * table named in a string, so that read would bypass them entirely.
   *
   * The guard owns its CLS detection oracle: it builds a `ColumnPolicyRewriter` internally in
   * `UnresolvedMode.Deny`, so a table whose columns the catalog cannot enumerate denies rather than
@@ -51,19 +54,32 @@ final class ProtectedWriteGuard(
   def check(sql: String, kind: StatementKind, eff: EffectiveSet, ctx: SchemaContext): GuardOutcome =
     val colPolicies = if clsEnabled then eff.columnPolicies else Nil
     val rowPolicies = if rlsEnabled then eff.rowPolicies else Nil
-    if kind == StatementKind.Select then Allow
-    else if eff.user.tenant.isEmpty then Allow // superuser
+    if eff.user.tenant.isEmpty then Allow // superuser
     else if colPolicies.isEmpty && rowPolicies.isEmpty then Allow
     else
-      val config  = Config.forDuckDB(ctx.defaultDatabase, ctx.defaultSchema, Set.empty)
-      val results = SqlParser.extract(sql, config).statements
-      // Re-parse the same stripped text with the same feature config so the ASTs line up 1:1 with
-      // the extractor's per-statement results by index. Anything that breaks that pairing is a read
-      // we cannot isolate, so it denies.
-      parseAsts(sql) match
-        case Some(asts) if asts.size == results.size =>
-          evaluate(results.zip(asts), eff, ctx, colPolicies, rowPolicies)
-        case _ => Deny(IncompleteDeny)
+      // Every kind, a plain SELECT included: a table named in a string is invisible to the
+      // rewriters, so the read would come back unfiltered and unmasked.
+      CatalogReachingCalls.find(sql) match
+        case Some(fn) => Deny(s"access denied: ${CatalogReachingCalls.denyReason(fn)}")
+        case None if kind == StatementKind.Select => Allow
+        case None => checkWrite(sql, eff, ctx, colPolicies, rowPolicies)
+
+  private def checkWrite(
+      sql: String,
+      eff: EffectiveSet,
+      ctx: SchemaContext,
+      colPolicies: List[ai.starlake.quack.ondemand.state.RoleColumnPolicy],
+      rowPolicies: List[ai.starlake.quack.ondemand.state.RoleRowPolicy]
+  ): GuardOutcome =
+    val config  = Config.forDuckDB(ctx.defaultDatabase, ctx.defaultSchema, Set.empty)
+    val results = SqlParser.extract(sql, config).statements
+    // Re-parse the same stripped text with the same feature config so the ASTs line up 1:1 with
+    // the extractor's per-statement results by index. Anything that breaks that pairing is a read
+    // we cannot isolate, so it denies.
+    parseAsts(sql) match
+      case Some(asts) if asts.size == results.size =>
+        evaluate(results.zip(asts), eff, ctx, colPolicies, rowPolicies)
+      case _ => Deny(IncompleteDeny)
 
   private def evaluate(
       pairs: List[(StatementResult, Statement)],

@@ -77,6 +77,12 @@ object AuditActions:
   val NodeRestart      = "node.restart"
   val StatementKill    = "statement.kill"
   val ManifestImport   = "manifest.import"
+  // fleet servers (runtimeType=fleet)
+  val FleetDrain   = "fleet.server.drain"
+  val FleetUndrain = "fleet.server.undrain"
+  val FleetRemove  = "fleet.server.remove"
+  val FleetApprove = "fleet.server.approve"
+  val FleetJoin    = "fleet.server.join"
   // federation
   val FederationSourceUpsert = "federation.source.upsert"
   val FederationSourceDelete = "federation.source.delete"
@@ -182,6 +188,11 @@ object AuditActions:
     NodeRestart,
     StatementKill,
     ManifestImport,
+    FleetDrain,
+    FleetUndrain,
+    FleetRemove,
+    FleetApprove,
+    FleetJoin,
     FederationSourceUpsert,
     FederationSourceDelete,
     FederationSecretUpsert,

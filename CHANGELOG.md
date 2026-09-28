@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.7
+## 0.9.9
 
 - **A read-only REST data edge serves tables and views as HTTP resources (#120).** HTTP-only tools
   (n8n, Zapier, a spreadsheet import, a cache) can now read governed data without a driver or SQL.
@@ -27,6 +27,130 @@
   (`service.restData`) and its NetworkPolicy port; the image exposes `31339`. There is no per-client
   rate limit yet: an internet-facing edge must sit behind a reverse proxy or WAF that rate-limits
   per client and per `Authorization` value.
+
+## 0.9.8
+
+- **Security: a session expiring mid-request no longer gains superuser access (#130).** Handler
+  gates re-resolved the caller's token and read "no scope" as "static `QOD_API_KEY`, unrestricted",
+  which is also what a session that expired or was revoked after the API guard admitted it looked
+  like. A tenant admin could reach the superuser-only manifest export, see every tenant in the
+  tenant, history, usage and audit listings, and pass the tenant-scope gates on RBAC mutations. The
+  lookup handed to handlers (REST, MCP, federated sources and the module SPI) now answers "no scope"
+  for the configured static key only; any other token that does not resolve gets no privilege. The
+  guard now resolves the credential once, so an expiry between its admin check and its tenant check
+  can no longer admit a request as admin while skipping the tenant check. Module SPI note:
+  `ManagerContext.scopeOf` now resolves PATs and never returns `None` for anything but the static
+  key; modules that treat `None` as unrestricted become correct without changes.
+
+- **Security: `query()`, `query_table()` and `ducklake_*` table functions are denied to
+  tenant-scoped principals (#128).** These functions name their target in a string the ACL parser
+  never sees. Under the tenant `*.*.* ALL` wildcard they read a sibling tenant's catalog that the
+  same wildcard refuses when named directly (unparseable statements took the same path), and
+  `ducklake_*` calls could read or maintain any catalog by name. For a principal with row or column
+  policies they also bypassed RLS and CLS, whether or not `acl.enabled` is on. They are now refused
+  for every tenant-scoped principal, lexically, so an unparseable statement cannot slip through.
+  Superusers are unaffected. Tenant users lose `ducklake_*` calls on their own catalog too.
+
+- **Branch merge: a main write landing mid-merge is no longer silently lost (#129).** A merge
+  validated its change set against main snapshot S and then committed with nothing tying the commit
+  to S. DuckLake pins a transaction's snapshot at its first read, not at `BEGIN`, and its commit
+  check misses a concurrent insert, update, delete or `ALTER` on a table the merge drops, so a
+  racing main write was overwritten or dropped. A trigger on `ducklake_snapshot_changes` in the
+  parent catalog database (schema `qod_merge_fence`) now refuses the merge commit unless it lands
+  directly on S; the merge answers `409 concurrent_write` and can be re-proposed. Any main commit in
+  that window refuses the merge, including writes to unrelated tables.
+
+- **Fleet: joining servers must be approved (#125).** A fleet server takes nodes, and with them the
+  metastore credentials, only once approved; the join token alone is no longer enough.
+  `QOD_FLEET_AUTO_APPROVE` (CIDRs) approves servers whose heartbeat comes from inside the list; the
+  default `0.0.0.0/0,::/0` keeps existing fleets working and logs a warning at boot, and an empty
+  list approves nobody automatically. `QOD_FLEET_TRUSTED_PROXIES` names the proxies whose
+  `X-Forwarded-For` is trusted. Admins approve with `qod fleet approve <name>`,
+  `POST /api/fleet/server/approve` or the Approve button on the Servers page. An approval is bound
+  to the source address it was granted to: a heartbeat from another address is refused
+  (`409 source_change_refused`) unless that address is in the list or the server is drained with no
+  node. Migrations 0041 and 0042 run on upgrade; existing servers are backfilled as approved.
+
+- **Fleet: reconcile repairs a node row that still names the previous server.** A manager that died
+  between a fleet claim and the node-row write left the row pointing at the old server, so health
+  probes and queries went to a dead address while the real node sat idle. Reconcile now takes the
+  address and token from the server holding the assignment and rewrites the row.
+
+- **`qod` names its profile file, and `qod agent` suggests fixes.** Every command prints the profile
+  in use and the config file it read, on stderr so `--json` output stays clean. A failed agent
+  heartbeat prints a one-line likely cause and fix (https against the plain-HTTP port, DNS, refused
+  connection, timeout, untrusted certificate, wrong join token, pending approval and each approval
+  conflict), once per distinct failure.
+
+## 0.9.7
+
+- **Fleet runtime: run nodes on bare servers, no Kubernetes (#123).** `QOD_RUNTIME_TYPE=fleet` plus
+  `QOD_FLEET_JOIN_TOKEN`. Linux and macOS servers join by running `qod agent`, which heartbeats the
+  manager (`POST /api/fleet/heartbeat`, header `X-Fleet-Token`) and runs the one node its reply
+  assigns through the bundled spawn script, bound to `QOD_NODE_BIND`. The manager claims a free
+  server whose reported memory fits the node, waits for the agent to report it running, and tracks
+  liveness on the database clock so HA replicas agree. With no free server the slot stays pending
+  and reconcile fills it as soon as a server joins. A server silent past `heartbeatTimeoutSec` is
+  unroutable but kept; past `reassignAfterSec` its node is respawned elsewhere in one store
+  transaction, and when no other server qualifies the dead holder keeps its assignment, so a server
+  that comes back resumes its node with no restart. A partial or cancelled spawn rolls back the
+  nodes it started. A known server name reporting a new address is refused unless drained.
+  `QOD_FLEET_EPHEMERAL=local` runs maintenance and merge nodes on the manager host. Operators get
+  `qod fleet servers | drain | undrain | remove` and a Servers page in the admin UI with pending and
+  server badges on pools. HA accepts the fleet runtime. Manager-to-node traffic is plain HTTP, so
+  fleet mode needs a private network.
+
+- **Native Quack front door: statement, session and kill lifecycle fixes (#121).** Twelve findings
+  from an external audit, each pinned by a regression test. `BEGIN` closed its own transaction link,
+  so every later statement of a client transaction reused a dead connection. The idle sweeper read
+  the clock and session table once at listener start and never again. A gen-1 `APPEND` whose `USE`
+  prelude failed escaped as a `MatchError`. Admin results closed their link before the client could
+  fetch them. An admin kill of a statement inside a client transaction was a no-op; it now
+  disconnects the transaction's link and fences the session until a `ROLLBACK` succeeds, so no later
+  statement can silently auto-commit on a fresh connection. Node load accounting leaked a phantom
+  in-flight request when a client dropped mid-call. The router's session registry was never closed
+  on either edge; the front door and the Flight edge now close and sweep it. The RBAC effective-set
+  cache keyed JWT claims by `Set.hashCode`, which collides (`"Aa"` / `"BB"`); the key now carries the
+  claim sets themselves.
+
+- **`qod agent` says when it reaches the manager.** It printed nothing on success, so a healthy
+  agent looked identical to one silently waiting. It now logs `connected to manager <url> as server
+  '<name>'` on its first successful heartbeat and `reconnected ...` on the first success after any
+  failed one (network error or non-2xx reply), once per transition.
+
+- **Fleet: see which server runs each node and each statement.** New `qod node list`, one row per
+  node with its `server` and `serverState` (`--tenant` / `--pool` filters, `--json`). Statement
+  history records now carry `serverName`, stamped from the node id when the statement is recorded,
+  returned by `/api/node/statements` and `/api/profile/statements` (so `qod node statements` shows
+  it) and shown as a Server column on the admin UI's Recent statements table when any statement ran
+  on a fleet server. Empty on the local and Kubernetes runtimes. The persisted statement search
+  (History page) does not carry it yet.
+
+- **A restarted manager keeps the nodes that are still running.** The control-plane store read node
+  rows back keyed by the tenant's display name, while pools are keyed by the tenant id, so after a
+  restart every node of a tenant whose display name differs from its id (`acme` / `Acme
+  Corporation`) was dropped from the in-memory pool. The row stayed and reconcile adopted the node,
+  but never wrote it back, so the pool showed no nodes and routed nothing. On the fleet runtime the
+  agents looked as if they never reconnected, even after restarting them; adopted Kubernetes pods
+  were hit the same way. Node rows are now keyed by tenant id.
+
+- **A manifest can reference an existing tenant by its id.** Import validation knew database
+  tenants only by display name, so a partial manifest (users, roles or groups without their tenant)
+  naming `tenant: acme` was refused with `tenant 'acme' not in YAML or DB` whenever the display name
+  differed. The exporter writes ids, so its own output could fail to re-import this way. Both forms
+  are now accepted.
+
+- **The FlightSQL and Quack `tenant` parameter is the tenant id, nothing else.** The handshake
+  swapped a value shaped like a legacy surrogate id (`t-<hex>`) for the tenant's display name
+  before looking up the pool, which could only miss since pools are keyed by id. The branch and
+  `Names.looksLikeTenantId` are gone.
+
+- **`QOD_HIBERNATE_SWEEP_SEC` and `QOD_HIBERNATE_IDLE_MIN` are honoured again.** The
+  `quack-on-demand.hibernation` block had no camelCase pureconfig hint, so the derived reader looked
+  for `sweep-seconds` / `default-idle-minutes`, found neither, and kept the defaults (300 s sweep,
+  no manager-wide idle minutes) whatever the environment said; only the single-word `enabled` key
+  was read. `HibernationConfigSpec` loads a camelCase overlay so a missing hint fails the build
+  instead of the operator's configuration.
 
 ## 0.9.6
 

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import typer
 
 from . import __version__
-from .config import Settings, default_profile, load_settings
+from .config import Settings, config_path, default_profile, load_settings
 from .registry import covers
 
 app = typer.Typer(
@@ -42,6 +42,11 @@ def _root(
     ),
 ) -> None:
     active = profile or default_profile()
+    if not ctx.resilient_parsing:
+        # stderr, so --json output and pipes stay clean.
+        path = config_path()
+        missing = "" if path.exists() else " (not found)"
+        typer.echo(f"qod: profile '{active}' from {path}{missing}", err=True)
     ctx.obj = AppCtx(settings=load_settings(active), json_output=json_output, profile=active)
 
 
@@ -85,6 +90,14 @@ from .commands import node, pool  # noqa: E402
 app.add_typer(pool.app, name="pool")
 app.add_typer(node.app, name="node")
 app.add_typer(node.statement_app, name="statement")
+
+from .commands import fleet  # noqa: E402
+
+app.add_typer(fleet.app, name="fleet")
+
+from .commands import agent as agent_cmd  # noqa: E402
+
+app.command("agent")(agent_cmd.agent)
 
 from .commands import group, membership, role, user  # noqa: E402
 

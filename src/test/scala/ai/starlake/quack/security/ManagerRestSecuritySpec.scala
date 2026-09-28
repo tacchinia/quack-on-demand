@@ -329,6 +329,44 @@ class ManagerRestSecuritySpec extends AnyFlatSpec with Matchers with SecurityHtt
     finally h.shutdown()
   }
 
+  it should "keep POST /api/fleet/heartbeat behind the guard outside fleet mode" in {
+    val fix = SecurityFixtures.freshStore()
+    // The harness boots runtimeType=local: the heartbeat is public at the guard only when
+    // runtimeType=fleet, so an anonymous call here must get the guard's 401, not a 404 from
+    // an unmounted route or anything the handler would answer.
+    val h = ManagerServerHarness.boot(fix.store, staticApiKey = Some("k1"))
+    try
+      val body = """{"name":"srv-1","advertiseHost":"10.0.0.1","nodePort":21900,""" +
+        """"node":{"assignmentEpoch":0,"state":"none"}}"""
+      val resp = post(h.httpClient, s"${h.baseUrl}/api/fleet/heartbeat", body)
+      withClue(s"POST /api/fleet/heartbeat body: ${resp.body()}") {
+        resp.statusCode() shouldBe 401
+      }
+    finally h.shutdown()
+  }
+
+  it should "answer 400 fleet_disabled (not 404) on the fleet routes outside fleet mode" in {
+    val fix = SecurityFixtures.freshStore()
+    val h   = ManagerServerHarness.boot(fix.store, staticApiKey = Some("k1"))
+    try
+      val list = get(h.httpClient, s"${h.baseUrl}/api/fleet/servers", apiKey = Some("k1"))
+      withClue(s"GET /api/fleet/servers body: ${list.body()}") {
+        list.statusCode() shouldBe 400
+        parse(list.body()).toOption.flatMap(_.hcursor.get[String]("error").toOption) shouldBe
+          Some("fleet_disabled")
+      }
+      // A static-key caller passes the guard but must not be able to write a server row.
+      val body = """{"name":"srv-1","advertiseHost":"10.0.0.1","nodePort":21900,""" +
+        """"node":{"assignmentEpoch":0,"state":"none"}}"""
+      val hb = post(h.httpClient, s"${h.baseUrl}/api/fleet/heartbeat", body, apiKey = Some("k1"))
+      withClue(s"POST /api/fleet/heartbeat body: ${hb.body()}") {
+        hb.statusCode() shouldBe 400
+        parse(hb.body()).toOption.flatMap(_.hcursor.get[String]("error").toOption) shouldBe
+          Some("fleet_disabled")
+      }
+    finally h.shutdown()
+  }
+
   // ------------------------------------------------------------------
   // C. Login admin gate (AuthHandlers.login)
   // ------------------------------------------------------------------
@@ -587,6 +625,76 @@ class ManagerRestSecuritySpec extends AnyFlatSpec with Matchers with SecurityHtt
       withClue(s"POST /api/manifest/import body: ${resp.body()}") {
         resp.statusCode() shouldBe 403
         errorCode(resp.body()) should contain("superuser_required")
+      }
+    finally h.shutdown()
+  }
+
+  // ------------------------------------------------------------------
+  // Session expiring between the guard's check and a handler's re-check
+  // ------------------------------------------------------------------
+  //
+  // The guard admits a live tenant-admin session; every later lookup of the same token (the
+  // guard's own second lookup, then the handler's) runs after expiry. An unresolvable token used
+  // to read as "static key" (scope None = unrestricted) at those later checks.
+
+  /** A session signer whose clock, once `armed.set(n)`, answers `n` more live reads and then jumps
+    * past every session's expiry.
+    */
+  private final class ExpiringClock:
+    private val t0                   = java.time.Instant.parse("2026-09-27T10:00:00Z")
+    val armed                        = new java.util.concurrent.atomic.AtomicInteger(-1)
+    val now: () => java.time.Instant = () =>
+      if armed.getAndUpdate(n => if n > 0 then n - 1 else n) == 0 then t0.plusSeconds(24 * 3600)
+      else t0
+
+  "a tenant-admin session expiring mid-request" should
+    "not reach the superuser-only manifest export" in {
+      val fix   = SecurityFixtures.freshStore()
+      val clock = new ExpiringClock
+      val h     = ManagerServerHarness.boot(
+        fix.store,
+        staticApiKey = Some("k1"),
+        sessions = new ai.starlake.quack.ondemand.api.SessionTokenStore(clock = clock.now)
+      )
+      try
+        val token = h.mintToken(
+          SecurityFixtures.AliceUsername,
+          SecurityFixtures.AlicePassword,
+          tenant = Some(SecurityFixtures.TenantId)
+        )
+        // The guard's first lookup sees the live session; everything after sees it expired.
+        clock.armed.set(1)
+        val resp = get(h.httpClient, s"${h.baseUrl}/api/manifest/export", apiKey = Some(token))
+        withClue(s"GET /api/manifest/export body: ${resp.body()}") {
+          resp.statusCode() should (be(401) or be(403))
+          resp.body() should not include "tenants:"
+        }
+      finally h.shutdown()
+    }
+
+  it should "not widen a tenant-filtered listing to every tenant" in {
+    val fix = SecurityFixtures.freshStore()
+    SecurityFixtures.addGlobexTenant(fix.store)
+    val clock = new ExpiringClock
+    val h     = ManagerServerHarness.boot(
+      fix.store,
+      staticApiKey = Some("k1"),
+      sessions = new ai.starlake.quack.ondemand.api.SessionTokenStore(clock = clock.now)
+    )
+    try
+      val token = h.mintToken(
+        SecurityFixtures.AliceUsername,
+        SecurityFixtures.AlicePassword,
+        tenant = Some(SecurityFixtures.TenantId)
+      )
+      // Control: with the session live, alice sees her own tenant only.
+      val live = get(h.httpClient, s"${h.baseUrl}/api/tenant/list", apiKey = Some(token))
+      live.body() should include(SecurityFixtures.TenantName)
+      live.body() should not include SecurityFixtures.GlobexTenantName
+      clock.armed.set(1)
+      val resp = get(h.httpClient, s"${h.baseUrl}/api/tenant/list", apiKey = Some(token))
+      withClue(s"GET /api/tenant/list body: ${resp.body()}") {
+        resp.body() should not include SecurityFixtures.GlobexTenantName
       }
     finally h.shutdown()
   }

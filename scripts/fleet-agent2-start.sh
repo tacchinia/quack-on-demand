@@ -1,0 +1,1 @@
+QOD_FLEET_JOIN_TOKEN=dev-join-token uvx --reinstall --from ./cli qod agent --manager http://127.0.0.1:20900 --insecure --name s2 --advertise-host 127.0.0.1 --node-port 23102 --state-dir /tmp/qod-fleet/s2

@@ -152,3 +152,108 @@ class BranchMergeLiveSpec extends AnyFlatSpec with Matchers with BranchLiveFixtu
         finally br.close()
       }
     }
+
+  // ---- main writes landing between validation and the merge commit -------------------
+  //
+  // The merge validates the change set against main snapshot S, then spawns a node and runs the
+  // batch. A main write committed in between must refuse the merge, never be overwritten. DuckLake's
+  // own commit-time check cannot be relied on: it is blind to a write that lands before the merge
+  // transaction's first read, and to any concurrent insert into a table the merge DROPs.
+
+  private def raceCase(
+      parent: ai.starlake.quack.ondemand.catalog.DuckLakeCatalogReader,
+      branchSql: String,
+      mainSql: String,
+      survivor: (String, List[String])
+  ) =
+    withBranchDb { (branchDb, branchDir) =>
+      val fork = BranchCloner(parentMeta)
+        .clone(parentMeta("dbName"), branchDb, branchDir.toString + "/")
+        .toOption
+        .get
+        .forkSnapshot
+      duck(branchSql, Some(branchDb), Some(branchDir))
+      val br = branchReader(branchDb)
+      try
+        val cs = BranchChanges.compute(br, parent, fork)
+        cs.mergeable shouldBe true
+        // The racing main write, AFTER validation.
+        duck(mainSql)
+        val message = BranchMergeSql.commitMessage("feature", "mg-race", "alice")
+        val sql     = BranchMergeSql.batch(
+          parentAlias = "lake",
+          branchAlias = BranchMergeSql.BranchAlias,
+          changes = cs.tables,
+          fork = fork,
+          head = cs.headSnapshot,
+          author = BranchMergeSql.author("acme", "bob"),
+          message = message
+        )
+        PostgresMergeFence.arm(parentMeta, message, cs.mainSnapshot) shouldBe Right(())
+        val out =
+          try duckAttempt(sql, Some(branchDb), Some(branchDir))
+          finally PostgresMergeFence.disarm(parentMeta, message)
+        out shouldBe a[Left[?, ?]]
+        parent.snapshotByCommitMessage(message) shouldBe None
+        duck(survivor._1) shouldBe survivor._2
+      finally br.close()
+    }
+
+  it should "refuse to overwrite a main update of a row the branch also updated" in
+    withCatalog("brrace1", extra) { (parent, _) =>
+      raceCase(
+        parent,
+        "UPDATE qod_branch.tpch1.region SET r_name = 'BRANCH' WHERE r_regionkey = 2;",
+        "UPDATE lake.tpch1.region SET r_name = 'MAIN' WHERE r_regionkey = 2;",
+        "SELECT r_name FROM lake.tpch1.region WHERE r_regionkey = 2;" -> List("MAIN")
+      )
+    }
+
+  it should "refuse to drop a table main inserted into after validation" in
+    withCatalog("brrace2", extra) { (parent, _) =>
+      raceCase(
+        parent,
+        "DROP TABLE qod_branch.tpch1.nation;",
+        "INSERT INTO lake.tpch1.nation VALUES (2, 'IT');",
+        "SELECT n_name FROM lake.tpch1.nation ORDER BY 1;" -> List("DE", "FR", "IT")
+      )
+    }
+
+  it should "let a merge commit when main has not moved since validation" in
+    withCatalog("brrace3", extra) { (parent, _) =>
+      withBranchDb { (branchDb, branchDir) =>
+        val fork = BranchCloner(parentMeta)
+          .clone(parentMeta("dbName"), branchDb, branchDir.toString + "/")
+          .toOption
+          .get
+          .forkSnapshot
+        duck(
+          "UPDATE qod_branch.tpch1.region SET r_name = 'BRANCH' WHERE r_regionkey = 2;",
+          Some(branchDb),
+          Some(branchDir)
+        )
+        val br = branchReader(branchDb)
+        try
+          val cs      = BranchChanges.compute(br, parent, fork)
+          val message = BranchMergeSql.commitMessage("feature", "mg-clean", "alice")
+          val sql     = BranchMergeSql.batch(
+            "lake",
+            BranchMergeSql.BranchAlias,
+            cs.tables,
+            fork,
+            cs.headSnapshot,
+            BranchMergeSql.author("acme", "bob"),
+            message
+          )
+          PostgresMergeFence.arm(parentMeta, message, cs.mainSnapshot) shouldBe Right(())
+          try duck(sql, Some(branchDb), Some(branchDir))
+          finally PostgresMergeFence.disarm(parentMeta, message)
+          parent.snapshotByCommitMessage(message) shouldBe Some(cs.mainSnapshot + 1)
+          duck("SELECT r_name FROM lake.tpch1.region WHERE r_regionkey = 2;") shouldBe
+            List("BRANCH")
+          // A second arm on the same catalog reuses the installed trigger.
+          PostgresMergeFence.arm(parentMeta, "other", cs.mainSnapshot + 1) shouldBe Right(())
+          PostgresMergeFence.disarm(parentMeta, "other")
+        finally br.close()
+      }
+    }

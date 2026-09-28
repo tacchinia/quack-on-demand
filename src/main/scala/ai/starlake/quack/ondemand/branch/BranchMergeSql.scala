@@ -72,6 +72,8 @@ object BranchMergeSql:
         )
 
   /** The whole batch. `changes` must contain no `Altered` entry (the caller refuses those first).
+    * Only safe under an armed [[MergeFence]]: nothing in the batch itself ties the commit to the
+    * main snapshot the change set was validated against.
     */
   def batch(
       parentAlias: String,
@@ -85,7 +87,10 @@ object BranchMergeSql:
     val body = changes
       .sortBy(c => (c.kind.ordinal, c.schema, c.table))
       .flatMap(c => tableStatements(parentAlias, branchAlias, c, fork, head))
+    // No commit retries: a retry means main moved, which the merge fence refuses anyway, and
+    // DuckLake would otherwise spend its backoff budget before reporting it (see MergeFence).
     (List(
+      "SET ducklake_max_retry_count = 0",
       "BEGIN",
       s"CALL ducklake_set_commit_message(${lit(parentAlias)}, ${lit(author)}, ${lit(message)})"
     ) ++ body ++ List("COMMIT")).mkString("", ";\n", ";")

@@ -1341,6 +1341,60 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     out.left.get shouldBe a[RouterFailure.AccessDenied]
     capturedSql() shouldBe ""
 
+  it should "deny a SELECT that reaches an RLS table through query_table / query end-to-end" in:
+    // The row rewriter wraps base tables; a table named in a string is invisible to it, so
+    // without the guard these reads reach the node unfiltered.
+    List(
+      "SELECT * FROM query_table('main.customer')",
+      "SELECT * FROM query('SELECT * FROM main.customer')"
+    ).foreach { sql =>
+      val (router, capturedSql, _) =
+        setupWithRewriter(protectedWriteGuard = guardKnowingCustomer)
+      val out = router
+        .execute(
+          "rls-qt",
+          "alice",
+          poolKey,
+          sql,
+          effectiveSet = Some(effWithRowPolicies(List(rowPolicyCustomer)))
+        )
+        .unsafeRunSync()
+      withClue(sql) {
+        out shouldBe a[Left[?, ?]]
+        out.left.get shouldBe a[RouterFailure.AccessDenied]
+        capturedSql() shouldBe ""
+      }
+    }
+
+  it should "deny a tenant wildcard-ALL principal reading a sibling catalog via query_table" in:
+    val acl = new ai.starlake.quack.edge.sql.PostgresAclValidator(tenantCatalogs =
+      t => if t == "acme" then Set("memory") else Set.empty
+    )
+    val wildcardAll = ai.starlake.quack.ondemand.rbac.EffectiveSet(
+      tenantUser,
+      Nil,
+      Nil,
+      List(
+        ai.starlake.quack.ondemand.state.RolePermission("p-1", "r-1", "*", "*", "*", "ALL")
+      ),
+      Nil
+    )
+    val (router, capturedSql, _) = setupWithRewriter(validator = acl)
+    List(
+      "SELECT * FROM globex_db.main.secret",
+      "SELECT * FROM query_table('globex_db.main.secret')",
+      "SELECT * FROM query('SELECT * FROM globex_db.main.secret')"
+    ).foreach { sql =>
+      val out = router
+        .execute("acl-qt", "alice", poolKey, sql, effectiveSet = Some(wildcardAll))
+        .unsafeRunSync()
+      withClue(sql) {
+        out shouldBe a[Left[?, ?]]
+        out.left.get shouldBe a[RouterFailure.AccessDenied]
+      }
+    }
+    capturedSql() shouldBe ""
+
   it should "deny (not forward) a plain read when a stored row policy fails to apply at rewrite time" in:
     // Simulates a row policy stored before RowPredicateValidator rejected splice-unsafe
     // predicates: a trailing line comment that comments out the rewriter's own closing paren at

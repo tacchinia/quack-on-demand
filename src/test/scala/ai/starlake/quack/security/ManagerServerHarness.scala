@@ -282,7 +282,9 @@ object ManagerServerHarness:
       // convention without pulling pureconfig into the harness boot path. Currently
       // backs only QOD_PAT_MAX_DEPTH (PatHandlers.maxDepth); extend here, not with a
       // global, if a future spec needs another env-tunable knob.
-      env: Map[String, String] = Map.empty
+      env: Map[String, String] = Map.empty,
+      // Session signer. Specs that need to control expiry pass one built on their own clock.
+      sessions: SessionTokenStore = new SessionTokenStore
   ): Harness =
     val mgrCfg =
       minimalManagerConfig(port = 0).copy(apiKey = staticApiKey)
@@ -295,7 +297,6 @@ object ManagerServerHarness:
     sup.restore()
 
     val userStore = makeDuckDbUserStore()
-    val sessions  = new SessionTokenStore
     // Composed bearer lookup (session JWT first, then PAT), mirroring Main's
     // wiring; needed by UserHandlers for the self-lock guard.
     val bearerSessionOf
@@ -500,7 +501,10 @@ object ManagerServerHarness:
       if !mcpEnabled then None
       else
         val mcpScopeOf: String => Option[ai.starlake.quack.ondemand.auth.SessionScope] =
-          t => sessions.scopeOf(t).orElse(patAuth.flatMap(_.scopeOf(t)))
+          ai.starlake.quack.ondemand.auth.SessionScope.failClosed(
+            staticApiKey,
+            t => sessions.scopeOf(t).orElse(patAuth.flatMap(_.scopeOf(t)))
+          )
         val mcpCatalog = catalogHandlers.getOrElse(
           new CatalogHandlers((_, _) => noSnapshotReader, sup, store)
         )
@@ -616,6 +620,15 @@ object ManagerServerHarness:
       pat = patHandlers,
       patAuth = patAuth,
       scim = Some(new ai.starlake.quack.ondemand.api.ScimHandlers(sup, userStore, audit)),
+      // Mirrors Main: the fleet routes are always mounted; outside fleet mode the handler has no
+      // backend and answers 400 fleet_disabled.
+      fleet = Some(
+        new ai.starlake.quack.ondemand.api.FleetHandlers(
+          new ai.starlake.quack.ondemand.state.InMemoryFleetServerStore(),
+          mgrCfg.fleet,
+          backend = None
+        )
+      ),
       canonicalTenantIdOf = t => HandlerResolvers.resolveTenantId(sup, t),
       mcpRoutes = mcpRoutes
     )

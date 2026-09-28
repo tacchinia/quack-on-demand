@@ -82,6 +82,26 @@ trait BranchLiveFixture extends PostgresFixture:
   /** Runs SQL in a fresh duckdb CLI session with `lake` (and optionally `qod_branch`) attached;
     * returns stdout as CSV lines without header. Fails the test on a non-zero exit.
     */
+  /** Like [[duck]] but a failing script is a value: `Left(stderr)` instead of a test failure. */
+  protected def duckAttempt(
+      sql: String,
+      branchDb: Option[String] = None,
+      branchDir: Option[Path] = None
+  ): Either[String, List[String]] =
+    val script = attachPrelude(branchDb, branchDir) + sql + "\n"
+    val tmp    = Files.createTempFile("branch-live", ".sql")
+    Files.writeString(tmp, script)
+    val out = new StringBuilder
+    val err = new StringBuilder
+    try
+      val rc = (Process(Seq("duckdb", "-csv", "-noheader")) #< tmp.toFile) ! ProcessLogger(
+        l => out.append(l).append('\n'),
+        l => err.append(l).append('\n')
+      )
+      if rc != 0 || err.nonEmpty then Left(err.toString)
+      else Right(out.toString.linesIterator.map(_.trim).filter(_.nonEmpty).toList)
+    finally Files.deleteIfExists(tmp)
+
   protected def duck(
       sql: String,
       branchDb: Option[String] = None,

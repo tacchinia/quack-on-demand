@@ -165,7 +165,7 @@ def test_status_reports_a_running_embedded_control_plane(
 
         result = runner.invoke(app, ["--json", "status"])
         assert result.exit_code == 0, result.output
-        payload = json.loads(result.output)
+        payload = json.loads(result.stdout)
         assert payload["embeddedPostgres"] == f"running (localhost:{port})"
         assert payload["embeddedPostgresDir"] == str(pg_dir)
     finally:
@@ -191,7 +191,7 @@ def test_status_reports_a_stopped_embedded_control_plane(
 
     result = runner.invoke(app, ["--json", "status"])
     assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["embeddedPostgres"] == "stopped (data preserved)"
     assert payload["embeddedPostgresDir"] == str(pg_dir)
 
@@ -220,7 +220,7 @@ def test_status_finds_the_embedded_dir_persisted_by_qod_setup(
 
     result = runner.invoke(app, ["--json", "status"])
     assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["embeddedPostgres"] == "stopped (data preserved)"
     assert payload["embeddedPostgresDir"] == str(pg_dir)
 
@@ -237,6 +237,6 @@ def test_status_omits_the_embedded_line_for_an_external_postgres(
 
     result = runner.invoke(app, ["--json", "status"])
     assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert "embeddedPostgres" not in payload
     assert "embeddedPostgresDir" not in payload

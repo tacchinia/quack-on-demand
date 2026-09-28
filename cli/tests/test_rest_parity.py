@@ -37,6 +37,8 @@ EXCLUSIONS = {
     "/api/scim/v2/{tenant}/ServiceProviderConfig",
     "/api/scim/v2/{tenant}/ResourceTypes",
     "/api/scim/v2/{tenant}/Schemas",
+    # machine-to-machine: qod agent
+    "/api/fleet/heartbeat",
     # Read-only REST data edge (quack-rest): served on its own port, not the
     # manager's, to machine-to-machine clients (low-code tools, services) with a
     # PAT bearer. Humans read data through `qod sql` or MCP, so no CLI surface

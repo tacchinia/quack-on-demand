@@ -66,4 +66,4 @@ def test_json_yes_prints_a_single_json_object(runner):
     result = runner.invoke(app, ["--json"] + ARGS + ["--yes"])
     assert result.exit_code == 0, result.output
     assert route.call_count == 2
-    assert json.loads(result.output) == DONE
+    assert json.loads(result.stdout) == DONE

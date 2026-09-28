@@ -308,3 +308,53 @@ class ProtectedWriteGuardSpec extends AnyFlatSpec with Matchers:
       ctx
     ) shouldBe a[Deny]
   }
+
+  // ---- catalog-reaching table functions on the READ path ------------------
+  //
+  // query() / query_table() name their target in a string, so the RLS / CLS rewriters see a
+  // table function, not a base table, and forward the read unfiltered and unmasked.
+
+  "check on a SELECT" should "deny query_table / query for a principal with a row policy" in
+    List(
+      "SELECT * FROM query_table('tpch1.customer')",
+      "SELECT * FROM query('SELECT * FROM tpch1.customer')",
+      "SELECT c_id FROM tpch1.orders WHERE c_id IN (SELECT c_id FROM query_table('tpch1.customer'))"
+    ).foreach { sql =>
+      withClue(sql) {
+        guardWithCls().check(
+          sql,
+          StatementKind.Select,
+          eff(tenantUser, rows = List(rowPolicy)),
+          ctx
+        ) shouldBe a[Deny]
+      }
+    }
+
+  it should "deny query_table for a principal with a column policy" in {
+    guardWithCls().check(
+      "SELECT c_email FROM query_table('tpch1.customer')",
+      StatementKind.Select,
+      eff(tenantUser, cols = List(maskEmail)),
+      ctx
+    ) shouldBe a[Deny]
+  }
+
+  it should "leave principals without policies, and superusers, alone" in {
+    val sql = "SELECT * FROM query_table('tpch1.customer')"
+    guardWithCls().check(sql, StatementKind.Select, eff(tenantUser), ctx) shouldBe Allow
+    guardWithCls().check(
+      sql,
+      StatementKind.Select,
+      eff(superuser, rows = List(rowPolicy)),
+      ctx
+    ) shouldBe Allow
+  }
+
+  it should "leave an ordinary SELECT to the rewriters" in {
+    guardWithCls().check(
+      "SELECT * FROM tpch1.customer",
+      StatementKind.Select,
+      eff(tenantUser, rows = List(rowPolicy)),
+      ctx
+    ) shouldBe Allow
+  }

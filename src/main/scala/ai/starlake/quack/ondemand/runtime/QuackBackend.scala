@@ -27,6 +27,13 @@ trait QuackBackend:
     */
   def adopt(node: RunningNode): IO[Unit] = IO.unit
 
+  /** `node` as its runtime currently places it. A backend that can move a live node without the
+    * supervisor writing the row (fleet: a claim committed, then the manager died before the node
+    * row write) answers the real address and token, and reconcile rewrites the row. The same
+    * instance when nothing moved; the default never moves anything.
+    */
+  def located(node: RunningNode): IO[RunningNode] = IO.pure(node)
+
   /** Node ids with a live runtime for `key`, or None when the backend cannot enumerate (local mode,
     * or a transient apiserver error). Reconcile treats None as "fall back to the pid/socket probe"
     * and never prunes or respawns on it.

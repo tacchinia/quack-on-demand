@@ -1,0 +1,20 @@
+databaseChangeLog:
+  - changeSet:
+      id: 0041-fleet-server-approval
+      author: qod
+      changes:
+        # Existing servers stay schedulable: the column defaults backfill them as approved by
+        # 'upgrade', then the defaults are dropped so every new row states its approval.
+        - addColumn:
+            tableName: qodstate_fleet_server
+            columns:
+              - column: { name: approved, type: boolean, defaultValueBoolean: true, constraints: { nullable: false } }
+              - column: { name: approved_at, type: timestamptz, defaultValueComputed: "now()" }
+              - column: { name: approved_by, type: text, defaultValue: "upgrade" }
+        - dropDefaultValue: { tableName: qodstate_fleet_server, columnName: approved }
+        - dropDefaultValue: { tableName: qodstate_fleet_server, columnName: approved_at }
+        - dropDefaultValue: { tableName: qodstate_fleet_server, columnName: approved_by }
+        - addColumn:
+            tableName: qodstate_fleet_heartbeat
+            columns:
+              - column: { name: source_addr, type: text }

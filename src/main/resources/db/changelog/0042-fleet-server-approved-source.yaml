@@ -1,0 +1,12 @@
+databaseChangeLog:
+  - changeSet:
+      id: 0042-fleet-server-approved-source
+      author: qod
+      changes:
+        # The resolved source address an approved server is bound to. NULL while pending, and for
+        # rows approved before this column existed (0041 upgrade backfill) or approved while their
+        # source was unknown: the next heartbeat with a known source binds them (trust on first use).
+        - addColumn:
+            tableName: qodstate_fleet_server
+            columns:
+              - column: { name: approved_source, type: text }

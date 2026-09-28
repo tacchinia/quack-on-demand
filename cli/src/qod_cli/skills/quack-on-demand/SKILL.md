@@ -1576,6 +1576,81 @@ Things to know:
 - **Personal access tokens are not accepted** on this wire (same rule as FlightSQL); use
   a user and password or an OIDC bearer.
 
+## Fleet mode (nodes on your own servers, no Kubernetes)
+
+Manager: `QOD_RUNTIME_TYPE=fleet QOD_FLEET_JOIN_TOKEN=<random>` (plus HA if you run several managers).
+Every Linux or macOS server: `QOD_FLEET_JOIN_TOKEN=<random> uvx qod agent --manager https://mgr:20900 --advertise-host <data-ip>`
+under systemd or launchd (unit files below). Pass the token through the environment, never
+`--join-token`: a command-line argument is visible to every local user in `ps`. A joined server runs exactly one node; pools are scheduled
+onto free servers whose reported RAM covers the pool's `--memory`. `qod pool create --size 3` before three
+servers exist is fine: the pool shows `pending` (reason `none_free` or `none_fits`) until they join.
+
+The join token is as sensitive as the control-plane Postgres password: whoever holds it can join a
+server and receive the credentials of every pool scheduled onto it. Keep unit files root-only, rotate
+on suspicion (every heartbeat carries the token, so after a rotation restart each agent with the new value; an agent left on the old token goes unreachable, then dead), and check `qod fleet servers` for names you
+did not install. Managers and servers must share a private network: the manager-to-node hop is
+plain HTTP.
+
+**Approving servers.** `QOD_FLEET_AUTO_APPROVE` on the manager lists the networks (CIDRs,
+comma-separated) whose servers are approved as they join; the default `0.0.0.0/0,::/0` approves
+everyone, and an empty value approves no one automatically. A server outside the list joins with
+`approval: pending` (the UI shows "pending approval"), heartbeats, and takes no node; its agent
+logs "waiting for approval". Check where it came from and approve it:
+
+    qod fleet servers            # approval and sourceAddr fields
+    qod fleet approve <name>
+
+Behind a load balancer, list it in `QOD_FLEET_TRUSTED_PROXIES` or every server appears to come
+from the balancer. Removing a server forgets its approval. To refuse a server,
+`qod fleet remove <name>` and stop its agent, otherwise it re-joins as pending. A drained server
+that comes back from a new address loses its approval and is judged again.
+An approval is bound to the address it was approved from, so an approved server heartbeating from
+another machine gets `source_change_refused`; to move one, `qod fleet drain <name>`, start the
+agent on the new machine and let it re-join, `qod fleet approve <name>` once it shows as pending,
+then `qod fleet undrain <name>` (a new address inside `QOD_FLEET_AUTO_APPROVE` is accepted without
+this).
+After an upgrade, servers approved before the manager recorded source addresses bind to the first
+heartbeat from inside `QOD_FLEET_AUTO_APPROVE`; if you narrow the list, those outside it get
+`approval_unbound` (their heartbeats are refused) until you run `qod fleet drain <name>`,
+`qod fleet approve <name>` once it shows as pending, then `qod fleet undrain <name>`. `qod fleet
+approve` answers `source_unknown` while the server has no known source address yet: wait for its
+next heartbeat. Behind a trusted proxy that does not send `X-Forwarded-For`, a server's source
+stays unknown, so it stays pending and `qod fleet approve` answers `source_unknown`; fix the proxy
+or `QOD_FLEET_TRUSTED_PROXIES`.
+
+systemd unit (`/etc/systemd/system/qod-agent.service`):
+
+```
+[Service]
+ExecStart=/usr/local/bin/qod agent --manager https://mgr:20900 --advertise-host 10.0.3.17 --name %H
+Environment=QOD_FLEET_JOIN_TOKEN=<random>
+Restart=always
+KillMode=control-group
+[Install]
+WantedBy=multi-user.target
+```
+
+launchd plist (`/Library/LaunchDaemons/ai.starlake.qod-agent.plist`): `ProgramArguments` with the same
+command line, `KeepAlive` true, `EnvironmentVariables` carrying the token. On a crash the next agent
+start reaps the previous node through `node.pid` in the state dir.
+
+The node does NOT inherit the agent's whole environment (the agent holds the join token). It gets only
+`PATH HOME TMPDIR LANG LC_ALL TZ USER LOGNAME SHELL`, the proxy variables, `DUCKDB_BIN`, `QOD_APP_HOME`,
+`QOD_S3_*` / `QOD_AZURE_*`, and these metastore settings, so set them on the agent's unit when needed:
+`PG_ADMIN_DB` (the database `CREATE DATABASE` runs from, when it is not `postgres`), `PGSSLMODE`,
+`PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGCONNECT_TIMEOUT` (a metastore reached over TLS) and
+`SSL_CERT_FILE`. Anything else exported on the agent never reaches a node.
+
+- `qod fleet servers` lists servers with liveness (reachable / unreachable / dead) and the node they run.
+- Maintenance on a server: `qod fleet drain <name>` (its node moves elsewhere or goes pending), work,
+  `qod fleet undrain <name>`. To retire it: drain, stop the agent, `qod fleet remove <name>`.
+- A server silent longer than `QOD_FLEET_REASSIGN_AFTER_SEC` (default 600) loses its slot to a free server.
+- "no fleet server" on a maintenance run or branch merge: those need a spare server; keep one free, or set
+  `QOD_FLEET_EPHEMERAL=local` so they run on the manager host (needs duckdb there).
+- Data paths must be object storage reachable from every server; so must the metastore Postgres.
+- `qod pool create --cpu 2 --memory 4Gi` (or `pool set-resources`) caps each node's DuckDB threads and
+  memory_limit. This is DuckDB enforcing it, not the kernel; an explicit SET in the database init SQL wins.
+
 ## Reading over HTTP (REST data edge)
 
 A read-only HTTP listener for tools that speak nothing else (n8n, Zapier, a spreadsheet

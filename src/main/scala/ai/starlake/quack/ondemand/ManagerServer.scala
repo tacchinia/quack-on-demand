@@ -1,6 +1,6 @@
 package ai.starlake.quack.ondemand
 
-import ai.starlake.quack.{FlightConfig, ManagerConfig}
+import ai.starlake.quack.{FleetConfig, FlightConfig, ManagerConfig}
 import ai.starlake.quack.ondemand.api._
 import ai.starlake.quack.ondemand.telemetry.{
   AuditActions,
@@ -75,6 +75,9 @@ final class ManagerServer(
     pat: Option[PatHandlers] = None,
     // Branches (Epic 1). None (tests / branching disabled) leaves the routes unmounted.
     branches: Option[BranchHandlers] = None,
+    // Fleet agent heartbeat + server admin. None leaves the routes unmounted; Main always wires
+    // it (outside fleet mode the handler answers 400 fleet_disabled).
+    fleet: Option[FleetHandlers] = None,
     // PAT admission on /api: a PAT presented as the bearer credential (X-API-Key
     // header) is accepted wherever its owner's session JWT would be. None (tests /
     // callers without Postgres) keeps the guard session-and-static-key only.
@@ -100,10 +103,16 @@ final class ManagerServer(
   // cheap in-memory operation, and PatAuthenticator self-rejects any token
   // without the qod_pat_ prefix before touching the store, so the composition
   // costs a session caller nothing and a PAT caller one prefix check.
+  //
+  // `scopeOfToken` is what every handler gate receives. It is fail-closed: `None` only for the
+  // static key, never for a token that stopped resolving between the guard and the handler (see
+  // SessionScope.failClosed). The guard itself does not use it; it resolves once through
+  // `sessionOfToken`.
   private val scopeOfToken: String => Option[ai.starlake.quack.ondemand.auth.SessionScope] =
-    t => sessions.scopeOf(t).orElse(patAuth.flatMap(_.scopeOf(t)))
-  private val isAdminToken: String => Boolean =
-    t => sessions.isAdmin(t) || patAuth.exists(_.isAdmin(t))
+    ai.starlake.quack.ondemand.auth.SessionScope.failClosed(
+      cfg.apiKey,
+      t => sessions.scopeOf(t).orElse(patAuth.flatMap(_.scopeOf(t)))
+    )
   private val sessionOfToken: String => Option[SessionTokenStore.Session] =
     t => sessions.get(t).orElse(patAuth.flatMap(_.sessionOf(t)))
 
@@ -137,6 +146,9 @@ final class ManagerServer(
       // audit row) that an unrecognized path got before this feature existed, not silently
       // become "public" ahead of the route ever being wired.
       (cfg.auth.management.slIntegrationOn && path == "/api/auth/sso/redeem") ||
+      // Fleet agent heartbeat: the handler validates X-Fleet-Token itself. Gated on the
+      // runtime so the path stays 401 at the guard everywhere else.
+      (FleetConfig.isFleet(cfg.runtimeType) && path == "/api/fleet/heartbeat") ||
       modulePublicPrefixes.exists(p => path == p || path.startsWith(p + "/"))
 
   /** Paths a NON-ADMIN session may reach: the self-service profile surface only. Everything else on
@@ -236,11 +248,15 @@ final class ManagerServer(
         val staticMatch = (staticConfigured, headerToken) match
           case (Some(expected), Some(actual)) => constantTimeEq(actual, expected)
           case _                              => false
-        val sessionAdmin = provided.exists(isAdminToken)
-        // Resolved once: it decides both the non-admin demotion below and the
-        // per-request tenant scope check further down.
-        val tokenScope      = provided.flatMap(scopeOfToken)
-        val nonAdminSession = tokenScope.isDefined && !sessionAdmin
+        // Resolved ONCE: the admin decision, the non-admin demotion below and the
+        // per-request tenant scope check further down all read this one lookup. Separate
+        // lookups race a session expiring between them: admitted as admin by the first,
+        // then an absent scope skipped the tenant check. A PAT's synthetic session carries
+        // role "admin" exactly when PatAuthenticator.isAdmin holds.
+        val resolved        = provided.flatMap(sessionOfToken)
+        val sessionAdmin    = resolved.exists(_.profile.role.equalsIgnoreCase("admin"))
+        val tokenScope      = resolved.map(_.scope)
+        val nonAdminSession = resolved.isDefined && !sessionAdmin
 
         val admitted =
           staticMatch || sessionAdmin || (nonAdminSession && isProfileApi(path))
@@ -259,7 +275,7 @@ final class ManagerServer(
             // Audited under the caller's REAL identity (recoverable from the
             // session), so a low-privilege insider sweeping admin endpoints
             // leaves a trail.
-            val caller   = provided.flatMap(sessionOfToken).map(_.profile)
+            val caller   = resolved.map(_.profile)
             val username = caller.map(_.username).getOrElse("unknown")
             // Rate-limited per principal, not per host: the recorder writes
             // synchronously on the request path, so one authenticated session
@@ -443,6 +459,30 @@ final class ManagerServer(
       RestoreEndpoints.restoreEndpoint.serverLogic { case (req, token) =>
         h.restore(req, token)(scopeOfToken)
       }
+    }
+
+    // Fleet agent heartbeat: public at the guard (fleet runtime only), X-Fleet-Token checked
+    // inside the handler. The server admin endpoints go through the normal guard and are
+    // superuser-gated per request inside the handler.
+    val fleetEndpoints: List[ServerEndpoint[Any, IO]] = fleet.toList.flatMap { h =>
+      List[ServerEndpoint[Any, IO]](
+        FleetEndpoints.heartbeat.serverLogic { case (req, token, forwardedFor, remote) =>
+          h.heartbeat(req, token, remote.map(_.getAddress), forwardedFor)
+        },
+        FleetEndpoints.listServers.serverLogic(token => h.listServers(token)(scopeOfToken)),
+        FleetEndpoints.drainServer.serverLogic { case (req, token) =>
+          h.drain(req, token)(scopeOfToken)
+        },
+        FleetEndpoints.undrainServer.serverLogic { case (req, token) =>
+          h.undrain(req, token)(scopeOfToken)
+        },
+        FleetEndpoints.removeServer.serverLogic { case (req, token) =>
+          h.remove(req, token)(scopeOfToken)
+        },
+        FleetEndpoints.approveServer.serverLogic { case (req, token) =>
+          h.approve(req, token)(scopeOfToken)
+        }
+      )
     }
 
     // Branches (Epic 1). Session-gated per request via TenantScopeCheck inside the handler.
@@ -916,7 +956,7 @@ final class ManagerServer(
       NodeEndpoints.killStatement.serverLogic { case (req, token) =>
         activeStmts.kill(req, token)(scopeOfToken)
       }
-    ) ++ authEndpoints ++ ssoEndpoints ++ patEndpoints ++ passwordResetEndpoints ++ catalogEndpoints ++ tagEndpoints ++ maintenanceEndpoints ++ timeTravelEndpoints ++ catalogHistoryEndpoints ++ undropEndpoints ++ restoreEndpoints ++ branchEndpoints ++ metricsEndpoints ++ rbacEndpoints ++ scimEndpoints ++ federatedSourceEndpoints ++ moduleEndpoints
+    ) ++ authEndpoints ++ ssoEndpoints ++ patEndpoints ++ passwordResetEndpoints ++ catalogEndpoints ++ tagEndpoints ++ maintenanceEndpoints ++ timeTravelEndpoints ++ catalogHistoryEndpoints ++ undropEndpoints ++ restoreEndpoints ++ branchEndpoints ++ fleetEndpoints ++ metricsEndpoints ++ rbacEndpoints ++ scimEndpoints ++ federatedSourceEndpoints ++ moduleEndpoints
 
     val collisions = ai.starlake.quack.ondemand.module.RouteCollisions.check(endpoints)
     if collisions.nonEmpty then

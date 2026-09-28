@@ -128,7 +128,11 @@ final case class NodeInfo(
     duckdbSpillBytes: Option[Long] = None,
     // Declared catalogs that failed to ATTACH on this node (Iceberg REST today). Empty is the
     // healthy case; a non-empty list means the node serves everything EXCEPT these catalogs.
-    catalogAttachFailures: List[CatalogAttachFailureDto] = Nil
+    catalogAttachFailures: List[CatalogAttachFailureDto] = Nil,
+    // Fleet mode only: the server hosting the node and its liveness
+    // (reachable | unreachable | dead). None on every other runtime.
+    serverName: Option[String] = None,
+    serverState: Option[String] = None
 )
 
 final case class PoolResponse(
@@ -150,7 +154,17 @@ final case class PoolResponse(
     lockdownEffective: Boolean = false, // tri-state resolved against the global flag
     // Owner-declared demand scale-out band; both None on a fixed-size pool.
     minNodes: Option[Int] = None,
-    maxNodes: Option[Int] = None
+    maxNodes: Option[Int] = None,
+    // Fleet: slots the distribution wants that no node fills yet, and why the last spawn attempt
+    // left them pending ("none_free" | "none_fits"); 0 / None on every other backend. A dead node
+    // kept on its unreachable server because no other is free is a node, not a pending slot: it
+    // does not count in `pending`, but `pendingReason` still says why it was not moved. That
+    // kept-dead record is replica-local too: under HA a follower shows `pending = 0` and no
+    // reason for a pool whose only node sits on a dead server.
+    // `pendingReason` is replica-local (it explains the last spawn attempt of the replica that
+    // answers): under HA a follower may report pending > 0 with pendingReason = None.
+    pending: Int = 0,
+    pendingReason: Option[String] = None
 )
 
 final case class SetPoolResourcesRequest(
@@ -281,6 +295,84 @@ final case class SetMaxConcurrentRequest(
     max: Int
 )
 final case class NodeOpRequest(tenant: String, tenantDb: String, pool: String, nodeId: String)
+
+/** Fleet agent heartbeat (POST /api/fleet/heartbeat). `state` is one of none | starting | running
+  * | failed | stopped; `startedAt` is ISO-8601.
+  */
+final case class FleetNodeReportDto(
+    assignmentEpoch: Long,
+    nodeId: Option[String],
+    state: String,
+    pid: Option[Long],
+    error: Option[String],
+    startedAt: Option[String]
+)
+final case class FleetHeartbeatRequest(
+    name: String,
+    advertiseHost: String,
+    nodePort: Int,
+    agentVersion: Option[String],
+    os: Option[String],
+    duckdbVersion: Option[String],
+    cpus: Option[Int],
+    memoryBytes: Option[Long],
+    node: FleetNodeReportDto
+)
+final case class FleetPoolKeyDto(tenant: String, tenantDb: String, pool: String)
+final case class FleetAssignmentDto(
+    epoch: Long,
+    nodeId: String,
+    poolKey: FleetPoolKeyDto,
+    port: Int,
+    token: String,
+    kind: String,
+    env: Map[String, String],
+    dbInitSql: String,
+    objectStoreSql: String,
+    extraSetupSql: String,
+    lockdownSql: String
+)
+
+/** `approval` is approved | pending: a pending server gets no assignment until it is approved (`qod
+  * fleet approve`, or its address added to QOD_FLEET_AUTO_APPROVE).
+  */
+final case class FleetHeartbeatResponse(
+    heartbeatSec: Int,
+    assignment: Option[FleetAssignmentDto],
+    approval: String
+)
+
+/** One fleet server (GET /api/fleet/servers). `liveness` is reachable | unreachable | dead;
+  * `silentSeconds` is measured on the database clock. The pool key fields come from the current
+  * assignment and are None while the server is idle.
+  */
+final case class FleetServerDto(
+    name: String,
+    advertiseHost: String,
+    nodePort: Int,
+    liveness: String,
+    silentSeconds: Long,
+    unschedulable: Boolean,
+    assignedNodeId: Option[String],
+    tenant: Option[String],
+    tenantDb: Option[String],
+    pool: Option[String],
+    nodeState: String,
+    nodeError: Option[String],
+    agentVersion: Option[String],
+    duckdbVersion: Option[String],
+    cpus: Option[Int],
+    memoryBytes: Option[Long],
+    joinedAt: String,
+    lastHeartbeatAt: String,
+    approval: String,           // approved | pending
+    approvedBy: Option[String], // auto | upgrade | the approving admin
+    approvedAt: Option[String],
+    sourceAddr: Option[String],    // resolved address of the latest heartbeat
+    approvedSource: Option[String] // the source an approved server is bound to
+)
+final case class FleetServerListResponse(servers: List[FleetServerDto])
+final case class FleetServerOpRequest(name: String)
 
 final case class ActiveStatementInfo(
     id: String,
@@ -683,7 +775,9 @@ final case class StatementHistoryEntry(
       * ms / prep 28 ms"). Absent for one-shot statements and for SkipExecute Prepare paths (DML /
       * DDL / transaction control).
       */
-    prepareDurationMs: Option[Long] = None
+    prepareDurationMs: Option[Long] = None,
+    /** Fleet mode only: the server that hosted the node when the statement ran. */
+    serverName: Option[String] = None
 )
 final case class StatementHistoryResponse(statements: List[StatementHistoryEntry])
 
@@ -1407,6 +1501,14 @@ object Dtos:
   given Codec[HealthResponse]           = deriveCodec
   given Codec[SetMaxConcurrentRequest]  = deriveCodec
   given Codec[NodeOpRequest]            = deriveCodec
+  given Codec[FleetNodeReportDto]       = deriveCodec
+  given Codec[FleetHeartbeatRequest]    = deriveCodec
+  given Codec[FleetPoolKeyDto]          = deriveCodec
+  given Codec[FleetAssignmentDto]       = deriveCodec
+  given Codec[FleetHeartbeatResponse]   = deriveCodec
+  given Codec[FleetServerDto]           = deriveCodec
+  given Codec[FleetServerListResponse]  = deriveCodec
+  given Codec[FleetServerOpRequest]     = deriveCodec
   given Codec[ErrorResponse]            = deriveCodec
   given Codec[TenantRequest]            = ConfiguredCodec.derived
   given Codec[TenantResponse]           = deriveCodec

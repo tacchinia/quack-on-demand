@@ -529,7 +529,9 @@ final class FlightSqlRouter(
     // Protected-write guard: runs AFTER the ACL gate, BEFORE the CLS/RLS rewriters. A
     // non-SELECT statement whose read side exposes a masked or row-filtered table is
     // denied outright (the rewriters wrap SELECTs, not the read half of a write, so
-    // without this step a CTAS / INSERT ... SELECT would launder protected values).
+    // without this step a CTAS / INSERT ... SELECT would launder protected values). It also
+    // denies, on every kind, a query() / query_table() style call: its target is a string the
+    // rewriters never see (see CatalogReachingCalls).
     // effectiveSet = None skips: no RBAC principal is bound, so no policy applies here
     // (the validator has already denied anything tenant-scoped).
     def protectedWrite(): Either[RouterFailure, Unit] = effectiveSet match

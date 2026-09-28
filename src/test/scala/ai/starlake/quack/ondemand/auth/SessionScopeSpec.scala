@@ -42,3 +42,38 @@ class SessionScopeSpec extends AnyFlatSpec with Matchers:
   it should "fall back to the full manageable set on a non-manageable request (no leak)" in {
     SessionScope.tenantsFilter(Some(admin), Some("initech")) shouldBe Some(Set("acme", "globex"))
   }
+
+  // ---- failClosed: None is reserved for the static key ----
+
+  private val lookup: String => Option[SessionScope] = {
+    case "live-admin" => Some(admin)
+    case "live-root"  => Some(SessionScope.Superuser)
+    case _            => None
+  }
+
+  "failClosed" should "answer None for the configured static key only" in {
+    val scopeOf = SessionScope.failClosed(Some("k1"), lookup)
+    scopeOf("k1") shouldBe None
+    scopeOf("k1x") shouldBe Some(SessionScope.NoAccess)
+    scopeOf("") shouldBe Some(SessionScope.NoAccess)
+  }
+
+  it should "pass resolvable tokens through unchanged" in {
+    val scopeOf = SessionScope.failClosed(Some("k1"), lookup)
+    scopeOf("live-admin") shouldBe Some(admin)
+    scopeOf("live-root") shouldBe Some(SessionScope.Superuser)
+  }
+
+  it should "give an expired, revoked or unknown token no privilege, never the static-key arm" in {
+    val scopeOf = SessionScope.failClosed(Some("k1"), lookup)
+    scopeOf("expired-session") shouldBe Some(SessionScope.NoAccess)
+    SessionScope.tenantsFilter(scopeOf("expired-session"), None) shouldBe Some(Set.empty)
+    SessionScope.tenantsFilter(scopeOf("expired-session"), Some("globex")) shouldBe Some(Set.empty)
+  }
+
+  it should "treat an unset or empty static key as matching nothing" in
+    List(None, Some("")).foreach { key =>
+      val scopeOf = SessionScope.failClosed(key, lookup)
+      scopeOf("") shouldBe Some(SessionScope.NoAccess)
+      scopeOf("anything") shouldBe Some(SessionScope.NoAccess)
+    }

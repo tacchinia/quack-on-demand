@@ -1,6 +1,7 @@
 package ai.starlake.quack
 
 import ai.starlake.quack.config.ConfigField
+import ai.starlake.quack.ondemand.fleet.Cidr
 
 import scala.annotation.meta.field
 
@@ -265,7 +266,7 @@ final case class DefaultMetastoreConfig(
 final case class HaConfig(
     @field @ConfigField(
       envVar = "QOD_HA_ENABLED",
-      description = "Enable active-active multi-replica manager mode (Kubernetes runtime only)."
+      description = "Enable active-active multi-replica manager mode (kubernetes or fleet runtime)."
     )
     enabled: Boolean = false,
     @field @ConfigField(
@@ -476,7 +477,9 @@ final case class ManagerConfig(
     apiKey: Option[String],
     @field @ConfigField(
       envVar = "QOD_RUNTIME_TYPE",
-      description = "Quack node runtime backend: 'local' (child processes) or 'kubernetes'."
+      description =
+        "Quack node runtime backend: 'local' (child processes), 'kubernetes' (pods) or 'fleet' " +
+          "(one node per server joined through qod agent)."
     )
     runtimeType: String,
     @field @ConfigField(
@@ -550,6 +553,7 @@ final case class ManagerConfig(
     autoscale: AutoscaleConfig = AutoscaleConfig(),
     hibernation: HibernationConfig = HibernationConfig(),
     branching: BranchingConfig = BranchingConfig(),
+    fleet: FleetConfig = FleetConfig(),
     managedObjectStore: ManagedObjectStoreConfig = ManagedObjectStoreConfig(),
     smtp: SmtpConfig = SmtpConfig(),
     mcp: McpConfig = McpConfig(),
@@ -720,6 +724,121 @@ final case class HibernationConfig(
     Option.when(defaultIdleMinutes > 0)(
       scala.concurrent.duration.DurationInt(math.max(5, defaultIdleMinutes)).minutes
     )
+
+/** Fleet runtime (`runtimeType = fleet`): quack nodes on bare servers that join through
+  * `qod agent`. See docs/superpowers/specs/2026-09-25-fleet-backend-design.md.
+  */
+final case class FleetConfig(
+    @field @ConfigField(
+      envVar = "QOD_FLEET_JOIN_TOKEN",
+      description = "Shared secret every agent heartbeat carries. Required when runtimeType=fleet.",
+      sensitive = true
+    )
+    joinToken: String = "",
+    @field @ConfigField(
+      envVar = "QOD_FLEET_HEARTBEAT_SEC",
+      description = "Agent heartbeat interval in seconds; returned to agents in every reply."
+    )
+    heartbeatSec: Int = 5,
+    @field @ConfigField(
+      envVar = "QOD_FLEET_HEARTBEAT_TIMEOUT_SEC",
+      description = "Silence beyond this many seconds marks a server unreachable."
+    )
+    heartbeatTimeoutSec: Int = 30,
+    @field @ConfigField(
+      envVar = "QOD_FLEET_REASSIGN_AFTER_SEC",
+      description =
+        "Unreachable beyond this many seconds moves the server's node slot to a free server. " +
+          "0 = at once, -1 = never."
+    )
+    reassignAfterSec: Int = 600,
+    @field @ConfigField(
+      envVar = "QOD_FLEET_STARTUP_TIMEOUT_SEC",
+      description = "How long a claim waits for the agent to report the node running."
+    )
+    startupTimeoutSec: Int = 120,
+    @field @ConfigField(
+      envVar = "QOD_FLEET_STOP_TIMEOUT_SEC",
+      description = "How long a release waits for the agent to report the node stopped."
+    )
+    stopTimeoutSec: Int = 60,
+    @field @ConfigField(
+      envVar = "QOD_FLEET_EPHEMERAL",
+      description =
+        "Where maintenance and branch-merge nodes run: 'fleet' claims a server like any node, " +
+          "'local' runs them on the manager host through the local backend."
+    )
+    ephemeral: String = "fleet",
+    @field @ConfigField(
+      envVar = "QOD_FLEET_AUTO_APPROVE",
+      description =
+        "Comma-separated CIDRs: a server whose heartbeat comes from one of them is approved on " +
+          "join; any other waits for `qod fleet approve`. Empty = approve none automatically. " +
+          "The default admits every address."
+    )
+    autoApprove: String = "0.0.0.0/0,::/0",
+    @field @ConfigField(
+      envVar = "QOD_FLEET_TRUSTED_PROXIES",
+      description =
+        "Comma-separated CIDRs of proxies / load balancers whose X-Forwarded-For is believed " +
+          "when resolving a heartbeat's client address. Empty = believe none."
+    )
+    trustedProxies: String = ""
+):
+  require(heartbeatSec >= 1, "fleet: heartbeatSec must be >= 1")
+  require(Set("fleet", "local").contains(ephemeral), "fleet: ephemeral must be 'fleet' or 'local'")
+  require(heartbeatTimeoutSec > heartbeatSec, "fleet: heartbeatTimeoutSec must be > heartbeatSec")
+  require(
+    reassignAfterSec == 0 || reassignAfterSec == -1 || reassignAfterSec >= heartbeatTimeoutSec,
+    "fleet: reassignAfterSec must be 0, -1, or >= heartbeatTimeoutSec"
+  )
+  require(startupTimeoutSec >= 1, "fleet: startupTimeoutSec must be >= 1")
+  require(stopTimeoutSec >= 1, "fleet: stopTimeoutSec must be >= 1")
+
+  // Validated here so a bad value refuses boot. `def`s, not vals: ConfigRegistry pairs declared
+  // fields with constructor parameters by position.
+  FleetConfig
+    .parseCidrs("QOD_FLEET_AUTO_APPROVE", autoApprove)
+    .left
+    .foreach(e => throw new IllegalArgumentException(e))
+  FleetConfig
+    .parseCidrs("QOD_FLEET_TRUSTED_PROXIES", trustedProxies)
+    .left
+    .foreach(e => throw new IllegalArgumentException(e))
+
+  def autoApproveCidrs: List[Cidr] =
+    FleetConfig.parseCidrs("QOD_FLEET_AUTO_APPROVE", autoApprove).fold(e => sys.error(e), identity)
+
+  def trustedProxyCidrs: List[Cidr] =
+    FleetConfig
+      .parseCidrs("QOD_FLEET_TRUSTED_PROXIES", trustedProxies)
+      .fold(e => sys.error(e), identity)
+
+  /** The boot WARN when auto-approval admits a whole address family; None otherwise. */
+  def openAutoApproveWarning: Option[String] =
+    Option.when(autoApproveCidrs.exists(_.isEverything))(
+      "fleet auto-approve is open to every address: any holder of the join token is approved " +
+        "on join. Set QOD_FLEET_AUTO_APPROVE to restrict."
+    )
+
+  def ephemeralLocal: Boolean = ephemeral == "local"
+
+  def validateForRuntime(runtimeType: String, duckdbOnHost: => Boolean): Either[String, Unit] =
+    if !FleetConfig.isFleet(runtimeType) then Right(())
+    else if joinToken.trim.isEmpty then
+      Left("QOD_FLEET_JOIN_TOKEN must be set when runtimeType=fleet")
+    else if ephemeralLocal && !duckdbOnHost then
+      Left(
+        "QOD_FLEET_EPHEMERAL=local needs a duckdb binary on the manager host (DUCKDB_BIN or PATH)"
+      )
+    else Right(())
+
+object FleetConfig:
+  def isFleet(runtimeType: String): Boolean =
+    runtimeType.toLowerCase(java.util.Locale.ROOT) == "fleet"
+
+  def parseCidrs(env: String, raw: String): Either[String, List[Cidr]] =
+    Cidr.parseList(raw).left.map(e => s"$env: $e")
 
 /** Writable branches of DuckLake tenant-dbs (Epic 1): a branch is a cloned catalog served by its
   * own one-node pool; agents write there, a human reviews the change set and fast-forward merges.

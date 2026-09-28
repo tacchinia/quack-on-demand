@@ -91,6 +91,10 @@ class BranchServiceSpec extends AnyFlatSpec with Matchers:
     val cloneCalls   = mutable.ListBuffer.empty[(String, String, String)]
     val mergeBatches = mutable.ListBuffer.empty[String]
     var mergeFails   = Option.empty[String]
+    var beforeRun    = () => ()
+    var fenceFails   = Option.empty[String]
+    val fenceArms    = mutable.ListBuffer.empty[(String, String, Long)]
+    val fenceDisarms = mutable.ListBuffer.empty[String]
     val purged       = mutable.ListBuffer.empty[String]
     val service      = new BranchService(
       cfg = cfg,
@@ -104,15 +108,25 @@ class BranchServiceSpec extends AnyFlatSpec with Matchers:
       mergeExecutor = new MergeExecutor:
         def run(spec: NodeSpec, batch: String): IO[Either[String, Unit]] =
           mergeBatches += batch
+          beforeRun()
           mergeFails match
             case Some(err) => IO.pure(Left(err))
             case None      =>
-              // The batch's message is the second statement's third literal; the fake parent
+              // The batch's message is the commit-message call's third literal; the fake parent
               // reader answers the locate query for it.
-              val msg = batch.linesIterator.toList(1).split("'")(5)
+              val msg = batch.linesIterator
+                .find(_.startsWith("CALL ducklake_set_commit_message"))
+                .get
+                .split("'")(5)
               mainReader.committed.put(msg, mainReader.head + 1)
               mainReader.head += 1
               IO.pure(Right(())),
+      mergeFence = new MergeFence:
+        def arm(meta: Map[String, String], message: String, base: Long) =
+          fenceArms += ((meta("dbName"), message, base))
+          fenceFails.toLeft(())
+        def disarm(meta: Map[String, String], message: String) = fenceDisarms += message: Unit
+      ,
       counter = new ChangeCounter:
         def count(t: String, b: Branch, a: String, c: TableChange, f: Long, h: Long) =
           IO.pure(Right((3L, 1L, 2L)))
@@ -287,6 +301,11 @@ class BranchServiceSpec extends AnyFlatSpec with Matchers:
       "CALL ducklake_set_commit_message('acme_tpch', 'tenant:acme/user:boss'"
     )
     f.mergeBatches.head should include("\"acme_tpch\".\"tpch1\".\"region\"")
+    // The commit was fenced to the snapshot the change set was validated against, then unfenced.
+    f.fenceArms.map(a => (a._2, a._3)) shouldBe List((m.id, 10L)).map { case (id, base) =>
+      (BranchMergeSql.commitMessage("x", id, "root"), base)
+    }
+    f.fenceDisarms.toList shouldBe f.fenceArms.map(_._2).toList
     // teardown: pool and catalog gone, files purged, history row kept
     f.sup.get(PoolKey("acme", b.tenantDbName, b.poolName)) shouldBe None
     f.sup.findTenantDb("acme", b.tenantDbName) shouldBe None
@@ -310,6 +329,33 @@ class BranchServiceSpec extends AnyFlatSpec with Matchers:
     val b = f.store.findBranch(f.parent.id, "x").get
     b.status shouldBe BranchStatus.Open
     f.store.listBranchMerges(b.id).map(_.status) shouldBe List(BranchMergeStatus.Failed)
+  }
+
+  it should "not run the batch when the merge fence cannot be armed" in {
+    val f = new Fixture
+    f.create("x")
+    f.touchBranch()
+    f.service.propose("acme", f.parent.name, "x", f.admin1, None).unsafeRunSync()
+    f.fenceFails = Some("cannot arm the merge fence: connection refused")
+    val res = f.service.merge("acme", f.parent.name, "x", None, f.admin2, None).unsafeRunSync()
+    res.left.map(_.code) shouldBe Left("merge_failed")
+    f.mergeBatches shouldBe empty
+  }
+
+  it should "report concurrent_write when main moved and the fence refused the commit" in {
+    // What the engine says when the fence refuses: an exhausted retry budget, no "conflict".
+    val refused = "Failed to commit DuckLake transaction. Exceeded the maximum retry count of 0"
+    def attempt(mainMoves: Boolean) =
+      val f = new Fixture
+      f.create("x")
+      f.touchBranch()
+      f.service.propose("acme", f.parent.name, "x", f.admin1, None).unsafeRunSync()
+      f.mergeFails = Some(refused)
+      // main commits after validation, while the batch runs
+      if mainMoves then f.beforeRun = () => f.mainReader.head += 1
+      f.service.merge("acme", f.parent.name, "x", None, f.admin2, None).unsafeRunSync()
+    attempt(mainMoves = true).left.map(_.code) shouldBe Left("concurrent_write")
+    attempt(mainMoves = false).left.map(_.code) shouldBe Left("merge_failed")
   }
 
   it should "refuse altered tables as not fast-forwardable" in {

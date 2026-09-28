@@ -470,3 +470,52 @@ class PostgresAclValidatorSpec extends AnyFlatSpec with Matchers:
     val wildcard = effectiveWith(List(perm("*", "*", "*", "ALL")))
     filteredMeta.validate(mkAcmeCtx("SELECT sql FROM sqlite_master", wildcard)) shouldBe Allowed
   }
+
+  // ---- catalog-reaching table functions (query / query_table / ducklake_*) --
+  //
+  // These resolve their target from a STRING at run time, so the parser sees
+  // no table ref to scope. Under the tenant wildcard `*.*.* ALL` the unsupported
+  // arm used to admit them, reading a sibling catalog that direct SQL denies.
+
+  "catalog-reaching table functions" should
+    "be denied under the tenant wildcard ALL even though direct SQL to the sibling is denied" in {
+      val wildcard = effectiveWith(List(perm("*", "*", "*", "ALL")))
+      catalogAware.validate(
+        mkAcmeCtx("SELECT * FROM acme_other.main.secret", wildcard)
+      ) shouldBe a[Denied]
+      List(
+        "SELECT * FROM query_table('acme_other.main.secret')",
+        "SELECT * FROM query('SELECT * FROM acme_other.main.secret')",
+        "FROM query_table(['acme_other.main.secret'])",
+        "SELECT * FROM \"QUERY_TABLE\"('acme_other.main.secret')",
+        "SELECT * FROM system.main.query_table('acme_other.main.secret')",
+        "SELECT * FROM query_table/* c */ ('acme_other.main.secret')",
+        "SELECT * FROM (SELECT * FROM query('SELECT 1')) q",
+        "SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT 1'))",
+        "SELECT * FROM ducklake_table_insertions('acme_other', 'main', 'secret', 0, 9)",
+        "CALL ducklake_expire_snapshots('acme_other', dry_run => true)",
+        // Unparseable by jsqlparser: the parse-error arm used to be wildcard-coverable too.
+        "SELECT * FROM query_table('acme_other.main.secret') QUALIFY QUALIFY"
+      ).foreach { sql =>
+        withClue(sql) {
+          catalogAware.validate(mkAcmeCtx(sql, wildcard)) match
+            case Denied(msg, _) => msg should include("resolves its target at run time")
+            case other          => fail(s"expected Denied, got $other")
+        }
+      }
+    }
+
+  it should "still be available to superusers" in {
+    val superuser = RbacUser(id = "u-su", tenant = None, username = "admin", role = "admin")
+    val eff       = EffectiveSet(superuser, Nil, Nil, Nil, Nil)
+    catalogAware.validate(
+      mkAcmeCtx("SELECT * FROM query_table('acme_other.main.secret')", eff)
+    ) shouldBe Allowed
+  }
+
+  it should "not trip on identifiers that merely contain the function names" in {
+    val wildcard = effectiveWith(List(perm("*", "*", "*", "ALL")))
+    catalogAware.validate(
+      mkAcmeCtx("SELECT my_query(1), query FROM acme_tpch.main.query_log", wildcard)
+    ) shouldBe Allowed
+  }

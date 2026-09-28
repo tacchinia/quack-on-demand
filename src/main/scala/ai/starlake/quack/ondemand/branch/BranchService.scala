@@ -83,6 +83,8 @@ final class BranchService(
       */
     cloneCatalog: (Map[String, String], String, String, String) => Either[String, CloneResult],
     mergeExecutor: MergeExecutor,
+    /** Holds the merge commit to the main snapshot its change set was validated against. */
+    mergeFence: MergeFence,
     counter: ChangeCounter,
     purgeFiles: (String, Map[String, String]) => Either[String, Unit],
     audit: AuditRecorder = AuditRecorder.noop,
@@ -670,35 +672,66 @@ final class BranchService(
           case None =>
             refuse(BranchFailure.upstream("merge_failed", "cannot build the merge node spec"))
           case Some(spec) =>
-            mergeExecutor.run(spec, batch).flatMap { outcome =>
-              // Locate the merge snapshot by its unique message: the authority on "did it
-              // commit", which also settles a timed-out wait.
-              IO.blocking(resolveReader(tenant, parent.name).snapshotByCommitMessage(message))
-                .flatMap {
-                  case Some(snap) => finishMerge(tenant, parent, b, merge, cs, snap, actor, apiKey)
-                  case None       =>
-                    val reason = outcome.left.getOrElse("committed snapshot not found")
-                    val f      =
-                      if reason.toLowerCase(Locale.ROOT).contains("conflict") then
-                        BranchFailure.conflict(
-                          "concurrent_write",
-                          s"merge lost a commit race: $reason"
-                        )
-                      else BranchFailure.upstream("merge_failed", reason)
-                    IO.blocking {
-                      store.updateBranchMerge(
-                        merge.copy(
-                          status = BranchMergeStatus.Failed,
-                          approver = Some(actor.identity),
-                          error = Some(reason),
-                          decidedAt = Some(now())
-                        )
-                      )
-                      // A failed attempt reopens the proposal: re-propose to retry.
-                      store.updateBranch(b.copy(status = BranchStatus.Open))
-                    } *> refuse(f)
-                }
+            // The change set was validated against main at cs.mainSnapshot; a main write that
+            // commits between here and the batch's commit would otherwise be built upon or
+            // overwritten. The fence refuses the merge commit unless it lands directly on top.
+            val meta       = sup.effectiveMetastoreFor(tenant, parent.name)
+            val parentMeta = meta.updated("dbName", meta.getOrElse("dbName", parent.name))
+            IO.blocking(mergeFence.arm(parentMeta, message, cs.mainSnapshot)).flatMap {
+              case Left(err) => refuse(BranchFailure.upstream("merge_failed", err))
+              case Right(_)  =>
+                mergeExecutor
+                  .run(spec, batch)
+                  .guarantee(IO.blocking(mergeFence.disarm(parentMeta, message)))
+                  .flatMap(settle(tenant, parent, b, merge, cs, message, actor, apiKey, refuse))
             }
+    }
+
+  /** Settles a merge attempt once the batch returned (or timed out): the commit message located on
+    * main is the authority on "did it commit".
+    */
+  private def settle(
+      tenant: String,
+      parent: TenantDb,
+      b: Branch,
+      merge: BranchMerge,
+      cs: BranchChangeSet,
+      message: String,
+      actor: BranchActor,
+      apiKey: Option[String],
+      refuse: BranchFailure => IO[Res[(Branch, BranchMerge, BranchChangeSet)]]
+  )(outcome: Either[String, Unit]): IO[Res[(Branch, BranchMerge, BranchChangeSet)]] =
+    IO.blocking {
+      val reader = resolveReader(tenant, parent.name)
+      (reader.snapshotByCommitMessage(message), reader.maxSnapshotId())
+    }.flatMap {
+      case (Some(snap), _) =>
+        finishMerge(tenant, parent, b, merge, cs, snap, actor, apiKey)
+      case (None, mainNow) =>
+        val reason = outcome.left.getOrElse("committed snapshot not found")
+        // Main moving past the validated snapshot is what the fence refuses; the
+        // engine reports it only as an exhausted retry budget.
+        val f =
+          if mainNow.exists(_ != cs.mainSnapshot) ||
+            reason.toLowerCase(Locale.ROOT).contains("conflict")
+          then
+            BranchFailure.conflict(
+              "concurrent_write",
+              s"merge lost a commit race: $reason"
+            )
+          else BranchFailure.upstream("merge_failed", reason)
+        IO.blocking {
+          store.updateBranchMerge(
+            merge.copy(
+              status = BranchMergeStatus.Failed,
+              approver = Some(actor.identity),
+              error = Some(reason),
+              decidedAt = Some(now())
+            )
+          )
+          // A failed attempt reopens the proposal: re-propose to retry.
+          store.updateBranch(b.copy(status = BranchStatus.Open))
+        } *> refuse(f)
     }
 
   private def finishMerge(

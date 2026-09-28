@@ -21,8 +21,9 @@ class BranchMergeSqlSpec extends AnyFlatSpec with Matchers:
       message = "merge branch f [mg-1] proposed by alice"
     )
     val lines = sql.linesIterator.toList
-    lines.head shouldBe "BEGIN;"
-    lines(1) shouldBe
+    lines.head shouldBe "SET ducklake_max_retry_count = 0;"
+    lines(1) shouldBe "BEGIN;"
+    lines(2) shouldBe
       "CALL ducklake_set_commit_message('acme_tpch', 'tenant:acme/user:bob', 'merge branch f [mg-1] proposed by alice');"
     lines.last shouldBe "COMMIT;"
     sql should include(

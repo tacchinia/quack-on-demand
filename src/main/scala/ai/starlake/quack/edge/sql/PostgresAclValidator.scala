@@ -77,7 +77,14 @@ final class PostgresAclValidator(
         Allowed
 
       case Some(eff) =>
-        validateForPrincipal(context, eff)
+        // Ahead of every other arm, and never wildcard-coverable: the target of these calls is
+        // a string the parser cannot see, so the wildcard's tenant-catalog scoping cannot apply.
+        CatalogReachingCalls.find(context.statement) match
+          case Some(fn) =>
+            val msg = CatalogReachingCalls.denyReason(fn)
+            logger.warn(s"ACL DENIED: user=${context.username}: $msg")
+            Denied(msg)
+          case None => validateForPrincipal(context, eff)
 
   /** Deny `msg` unless the principal holds an unrestricted `*.*.* ALL` grant, which covers
     * statements the parser could not fully resolve (unparseable / unsupported constructs /

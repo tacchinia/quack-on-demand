@@ -4,6 +4,7 @@ import { api, errorMessage } from '../api/client';
 import type { PoolResponse, NodeInfo, StatementHistoryEntry, ActiveStatementInfo } from '../api/types';
 import { useAuth } from '../auth/AuthContext';
 import SqlHighlight from '../components/SqlHighlight';
+import { fmtBytes } from '../format';
 
 interface Row extends NodeInfo {
   tenant:   string;
@@ -34,6 +35,7 @@ export default function Nodes() {
   const [filter, setFilter]   = useState<string>(searchParams.get('tenant') ?? authTenant ?? '');
   const [nodeFilter, setNodeFilter] = useState<string>(searchParams.get('node') ?? '');
   const [history, setHistory] = useState<StatementHistoryEntry[]>([]);
+  const showServer = history.some(h => h.serverName);
   const [expanded, setExpanded] = useState<number | null>(null);
   // Row index whose Copy button was just clicked, for the brief "Copied"
   // feedback. Cleared on a timeout.
@@ -301,7 +303,12 @@ export default function Nodes() {
                 </td>
                 <td><RoleBadge role={n.role} /></td>
                 <td><HealthBadge healthy={n.healthy} draining={n.draining} quarantined={n.quarantined} /></td>
-                <td><code>{n.host}:{n.port}</code></td>
+                <td>
+                  <code>{n.serverName ? `${n.serverName} (${n.host}:${n.port})` : `${n.host}:${n.port}`}</code>
+                  {n.serverState && n.serverState !== 'reachable' && (
+                    <span className="badge warn" style={{ marginLeft: 6 }}>server unreachable</span>
+                  )}
+                </td>
                 <td style={{ textAlign: 'right' }}>{n.inFlight}</td>
                 <td style={{ textAlign: 'right' }}>{n.qps.toFixed(1)}</td>
                 <td style={{ textAlign: 'right' }}>{n.totalServed.toLocaleString()}</td>
@@ -400,6 +407,7 @@ export default function Nodes() {
       </div>
 
       <h2 style={{ marginTop: '2rem' }}>Recent statements</h2>
+      {/* Server column only when some statement ran on a fleet server (fleet runtime). */}
       <div className="card" style={{ padding: 0 }}>
         <table>
           <thead>
@@ -408,6 +416,7 @@ export default function Nodes() {
               <th>User</th>
               <th>Tenant / Pool</th>
               <th>Node</th>
+              {showServer && <th>Server</th>}
               <th>Status</th>
               <th style={{ textAlign: 'right' }}>Duration</th>
               <th>SQL</th>
@@ -415,7 +424,7 @@ export default function Nodes() {
           </thead>
           <tbody>
             {history.length === 0 ? (
-              <tr><td colSpan={7} className="empty">No statements recorded yet.</td></tr>
+              <tr><td colSpan={showServer ? 8 : 7} className="empty">No statements recorded yet.</td></tr>
             ) : history
                 .filter(h => !filter || h.tenant === filter)
                 .filter(h => !nodeFilter || h.nodeId === nodeFilter)
@@ -439,6 +448,7 @@ export default function Nodes() {
                           <code>{h.nodeId}</code>
                         </Link>
                       </td>
+                      {showServer && <td><code>{h.serverName ?? ''}</code></td>}
                       <td><StatusBadge status={h.status} /></td>
                       <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
                         <div>{h.durationMs} ms</div>
@@ -492,18 +502,6 @@ function fmtElapsed(ms: number): string {
   const s = Math.floor(ms / 1000);
   if (s < 60) return `${s}s`;
   return `${Math.floor(s / 60)}m ${s % 60}s`;
-}
-
-/** Human-readable byte count (binary units, one decimal). Undefined/null means
-  * the node's engine stats have not been scraped yet - render as a dash. */
-function fmtBytes(n: number | null | undefined): string {
-  if (n == null) return '-';
-  if (n < 1024) return `${n} B`;
-  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
-  let v = n;
-  let u = -1;
-  do { v /= 1024; u++; } while (v >= 1024 && u < units.length - 1);
-  return `${v.toFixed(1)} ${units[u]}`;
 }
 
 /** Human-readable time-of-day for the table; full ISO on hover via title would
