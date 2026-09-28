@@ -68,6 +68,13 @@ enum RestError(val status: StatusCode, val code: String, val message: String):
         "too_many_auth_failures",
         "too many failed authentication attempts, retry later"
       )
+  // The per-user or edge-wide in-flight cap (§7.3); always `Retry-After: 1`.
+  case TooManyRequests
+      extends RestError(
+        StatusCode.TooManyRequests,
+        "too_many_requests",
+        "too many concurrent requests, retry shortly"
+      )
   // Node exception text is never passed through (§4.2); the handler appends the request id.
   case UpstreamError extends RestError(StatusCode.BadGateway, "upstream_error", "upstream error")
 

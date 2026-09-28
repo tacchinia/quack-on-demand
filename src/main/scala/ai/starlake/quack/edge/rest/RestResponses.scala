@@ -81,8 +81,9 @@ object RestResponses:
     val extra = e match
       case RestError.Unauthorized => List(Header("WWW-Authenticate", "Bearer"))
       case RestError.PoolResuming => List(Header("Retry-After", RetryAfterSec.toString))
-      // §7.3: a blocked client learns when its block ends.
+      // §7.3: a blocked client learns when its block ends; a full cap frees up quickly.
       case RestError.TooManyAuthFailures(s) => List(Header("Retry-After", s.toString))
+      case RestError.TooManyRequests        => List(Header("Retry-After", "1"))
       case _                                => Nil
     (
       status,

@@ -15,14 +15,14 @@ import ai.starlake.quack.ondemand.api.{
 import ai.starlake.quack.ondemand.auth.PatPrincipal
 import ai.starlake.quack.ondemand.catalog.DuckLakeCatalogReader
 import cats.data.EitherT
-import cats.effect.IO
+import cats.effect.{IO, Outcome}
 import com.typesafe.scalalogging.LazyLogging
 import io.circe.Json
 import org.apache.arrow.vector.ipc.ArrowReader
 import sttp.model.{Header, StatusCode}
 
 import java.time.Instant
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.concurrent.duration.*
 object RestEdgeHandlers:
 
@@ -68,8 +68,9 @@ object RestEdgeHandlers:
   * statement is text from [[RestSql]] and goes through that executor exactly as MCP `run_sql` does,
   * so the validator and the rewriters see an ordinary SELECT.
   *
-  * An HTTP-layer resource control (§7.3, O-1) wraps step 2 without touching the pipeline: the
-  * failed-auth throttle ([[AuthThrottle]], keyed by the client address).
+  * Two HTTP-layer resource controls (§7.3, O-1) wrap that pipeline without touching it: the
+  * failed-auth throttle around step 2 ([[AuthThrottle]], keyed by the client address) and one
+  * in-flight slot per request of the token's owner around steps 5 to 7 ([[UserLimiter]]).
   *
   * Ordering, settled here because §4.1 needs `pool`, `format` and `asOf*` BEFORE the probe while
   * `reserved_column` (Q6) is only decidable AFTER it: on `/rows`, a reserved parameter whose value
@@ -92,11 +93,14 @@ final class RestEdgeHandlers(
     /** Overrides `cfg.stmtTimeoutSec` (the H8 seam); a token's `stmtTimeoutMs` still lowers it. */
     stmtTimeout: Option[FiniteDuration] = None,
     /** The failed-auth throttle (§7.3), shared with [[RestEdgeServer]] in production. */
-    throttle: Option[AuthThrottle] = None
+    throttle: Option[AuthThrottle] = None,
+    /** The per-user in-flight cap (§7.3). */
+    limiter: Option[UserLimiter] = None
 ) extends LazyLogging:
 
   // Built from `cfg` when not given: a default parameter cannot refer to another one here.
   private val authThrottle: AuthThrottle = throttle.getOrElse(AuthThrottle(cfg, _ => ()))
+  private val userLimiter: UserLimiter   = limiter.getOrElse(UserLimiter(cfg))
 
   import RestEdgeHandlers.*
   import RestResponses.*
@@ -126,8 +130,11 @@ final class RestEdgeHandlers(
         fmt <- lift(formatOf(Route.Schemas, q, req.accept)).map(_._1)
         t   <- resolveTarget(p, tenant, tenantDb, q.pool, deferPool = false).map(_._1)
         cap = listingCap(t)
-        qr    <- execute(t, RestSql.listSchemas(t.catalog, cap), hiddenFailure(req.requestId), req)
-        found <- io(consume(qr)(r => readStrings(r.rows, cap)))
+        found <- withSlot(p) { slot =>
+          val sql = RestSql.listSchemas(t.catalog, cap)
+          execute(t, sql, hiddenFailure(req.requestId), req, slot)
+            .flatMap(qr => io(consume(qr)(r => readStrings(r.rows, cap))))
+        }
       yield listing(fmt, List("name"), found._1.map(r => List(Json.fromString(r(0)))), found._2)
     }
 
@@ -142,8 +149,10 @@ final class RestEdgeHandlers(
         t   <- resolveTarget(p, tenant, tenantDb, q.pool, deferPool = false).map(_._1)
         cap = listingCap(t)
         sql = RestSql.listTables(t.catalog, sch, cap)
-        qr    <- execute(t, sql, hiddenFailure(req.requestId), req)
-        found <- io(consume(qr)(r => readStrings(r.rows, cap)))
+        found <- withSlot(p) { slot =>
+          execute(t, sql, hiddenFailure(req.requestId), req, slot)
+            .flatMap(qr => io(consume(qr)(r => readStrings(r.rows, cap))))
+        }
         // Nothing visible in the schema is indistinguishable from no schema (§6.2).
         _ <- if found._1.isEmpty then fail(RestError.NotFound) else lift(Right(()))
       yield listing(
@@ -166,9 +175,14 @@ final class RestEdgeHandlers(
         t    <- resolveTarget(p, tenant, tenantDb, q.pool, deferPool = false).map(_._1)
         snap <- snapshotOf(tenant, t.td, q, deferTag = false, req.requestId).map(_._1)
         at = RestSql.Target(t.catalog, sch, tbl, snap)
-        pr   <- probe(t, at, req)
-        _    <- if pr._1.isEmpty then fail(RestError.NotFound) else lift(Right(()))
-        kind <- io(objectTypeOf(t, sch, tbl, req))
+        described <- withSlot(p) { slot =>
+          for
+            pr   <- probe(t, at, req, slot)
+            _    <- if pr._1.isEmpty then fail(RestError.NotFound) else lift(Right(()))
+            kind <- io(objectTypeOf(t, sch, tbl, req, slot))
+          yield (pr, kind)
+        }
+        (pr, kind) = described
       yield
         val cols = pr._1.map(c => List(Json.fromString(c.name), Json.fromString(c.kind.sqlType)))
         val body = fmt match
@@ -200,15 +214,20 @@ final class RestEdgeHandlers(
         t = tp._1
         sn <- snapshotOf(tenant, t.td, q, deferrable(Route.Rows, q, "asOfTag"), req.requestId)
         at = RestSql.Target(t.catalog, sch, tbl, sn._1)
-        pr <- probe(t, at, req)
-        rq <- lift(bindQuery(q, pr._1, List(f._2, tp._2, sn._2).flatten))
         // min(limit ?: defaultLimit, maxRows, token maxRows) (§6.3); the statement fetches one more.
         limit = t.caller.effectiveMaxRows(cfg.maxRows, q.limit.getOrElse(cfg.defaultLimit))
-        // Same node as the probe (§6.6): a soft pin, a vanished node falls back as usual.
-        pinnedCaller = t.caller.copy(preferredNode = Some(pr._2))
-        sql          = RestSql.render(at, rq, limit)
-        qr  <- execute(t.copy(caller = pinnedCaller), sql, dataFailure(req.requestId), req)
-        enc <- io(consume(qr)(r => RestResultEncoder.encode(f._1, r.rows, limit)))
+        // The probe and the data statement share ONE slot (§7.3).
+        enc <- withSlot(p) { slot =>
+          for
+            pr <- probe(t, at, req, slot)
+            rq <- lift(bindQuery(q, pr._1, List(f._2, tp._2, sn._2).flatten))
+            // Same node as the probe (§6.6): a soft pin, a vanished node falls back as usual.
+            pinned = t.copy(caller = t.caller.copy(preferredNode = Some(pr._2)))
+            sql    = RestSql.render(at, rq, limit)
+            qr  <- execute(pinned, sql, dataFailure(req.requestId), req, slot)
+            enc <- io(consume(qr)(r => RestResultEncoder.encode(f._1, r.rows, limit)))
+          yield enc
+        }
       yield
         val range =
           if enc.rows == 0 then "*/*" else s"${q.offset}-${q.offset.toLong + enc.rows - 1}/*"
@@ -248,6 +267,19 @@ final class RestEdgeHandlers(
     else if e == RestError.Unauthorized && !authThrottle.tryGlobal() then
       RestError.TooManyAuthFailures(1)
     else e
+
+  /** Runs `body` under one in-flight slot of the token's OWNER (§7.3), `(tenant, userId)` rather
+    * than the PAT, so minting more tokens buys no extra slots; 429 when a cap is reached. The
+    * request's own share of the slot is released when `body` ends, however it ends; each node call
+    * inside it holds a share of its own ([[execute]]) until the node work has actually finished.
+    */
+  private def withSlot[A](p: PatPrincipal)(body: UserLimiter.Hold => Step[A]): Step[A] =
+    EitherT(
+      IO(userLimiter.tryAcquire((p.user.tenant.getOrElse(""), p.user.id))).flatMap {
+        case None       => IO.pure(Left(RestError.TooManyRequests))
+        case Some(slot) => body(slot).value.guarantee(IO(slot.release()))
+      }
+    )
 
   // ---- path segments and parameters ----------------------------------------------------------
 
@@ -408,9 +440,10 @@ final class RestEdgeHandlers(
   private def probe(
       t: Target,
       at: RestSql.Target,
-      req: RestRequest
+      req: RestRequest,
+      slot: UserLimiter.Hold
   ): Step[(Vector[ProbedColumn], String)] =
-    execute(t, RestSql.probe(at), hiddenFailure(req.requestId), req).flatMap { qr =>
+    execute(t, RestSql.probe(at), hiddenFailure(req.requestId), req, slot).flatMap { qr =>
       io(consume(qr)(r => (ProbedColumn.fromArrow(r.rows.getVectorSchemaRoot.getSchema), r.nodeId)))
     }
 
@@ -418,9 +451,16 @@ final class RestEdgeHandlers(
     * tell the two apart; when the listing is denied (filtered metadata off, no grant on
     * `information_schema`) or cut by the cap, the type is unknown rather than guessed.
     */
-  private def objectTypeOf(t: Target, schema: String, name: String, req: RestRequest) =
+  private def objectTypeOf(
+      t: Target,
+      schema: String,
+      name: String,
+      req: RestRequest,
+      slot: UserLimiter.Hold
+  ) =
     val cap = listingCap(t)
-    execute(t, RestSql.listTables(t.catalog, schema, cap), hiddenFailure(req.requestId), req).value
+    val sql = RestSql.listTables(t.catalog, schema, cap)
+    execute(t, sql, hiddenFailure(req.requestId), req, slot).value
       .flatMap {
         case Left(_)   => IO.pure(None)
         case Right(qr) =>
@@ -435,16 +475,32 @@ final class RestEdgeHandlers(
   /** One executor call under the edge's own bounded wait, `min(stmtTimeoutSec, PAT stmtTimeoutMs)`
     * (§7.2): a result that arrives after the wait is closed, never dropped. A raised error is an
     * upstream failure whose text is logged, never returned.
+    *
+    * The call holds its own share of the request's `slot` (§7.3), retained right before the call
+    * starts and released only when the node work is over: when the executor fails or raises, or
+    * when its result is closed, by [[consume]] or, after a timeout or a disconnect, by the bounded
+    * wait's late close. An early HTTP answer (504, a cancelled request) never frees it.
     */
   private def execute(
       t: Target,
       sql: String,
       onFailure: RouterFailure => RestError,
-      req: RestRequest
+      req: RestRequest,
+      slot: UserLimiter.Hold
   ): Step[QueryResult] =
+    val node                                    = new AtomicReference(UserLimiter.Hold.Released)
+    def releaseNode: IO[Unit]                   = IO(node.get.release())
     val run: IO[Either[RestError, QueryResult]] =
       IO.defer(executor(t.caller, t.poolKey, sql))
-        .map(_.left.map(onFailure))
+        .guaranteeCase {
+          case Outcome.Succeeded(out) =>
+            out.flatMap(r => if r.isRight then IO.unit else releaseNode)
+          case _ => releaseNode
+        }
+        .map {
+          case Right(qr) => Right(releasingOnClose(qr, node.get))
+          case Left(f)   => Left(onFailure(f))
+        }
         .handleError { e =>
           logger.warn(
             s"rest [${req.requestId}] executor raised ${e.getClass.getName}: ${e.getMessage}"
@@ -452,7 +508,21 @@ final class RestEdgeHandlers(
           Left(RestError.UpstreamError)
         }
     EitherT(
-      BoundedWait.closingLate(run, timeoutFor(t.caller), RestError.StatementTimeout, _.close())
+      BoundedWait.closingLate(
+        run,
+        timeoutFor(t.caller),
+        RestError.StatementTimeout,
+        _.close(),
+        beforeStart = IO(node.set(slot.retain()))
+      )
+    )
+
+  /** `qr`, whose close also releases `node`, even when closing the result throws. */
+  private def releasingOnClose(qr: QueryResult, node: UserLimiter.Hold): QueryResult =
+    qr.copy(close =
+      () =>
+        try qr.close()
+        finally node.release()
     )
 
   private def timeoutFor(caller: ExecCaller): FiniteDuration =

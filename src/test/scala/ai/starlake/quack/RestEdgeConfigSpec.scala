@@ -40,6 +40,8 @@ class RestEdgeConfigSpec extends AnyFlatSpec with Matchers:
     defaults.authBlockSec shouldBe 300
     defaults.authFailuresGlobalPerSec shouldBe 50
     defaults.authThrottleMaxEntries shouldBe 100000
+    defaults.maxConcurrentPerUser shouldBe 4
+    defaults.maxConcurrentTotal shouldBe 64
   }
 
   it should "parse trustedProxies as IPv4 and IPv6 CIDRs" in {
@@ -86,7 +88,9 @@ class RestEdgeConfigSpec extends AnyFlatSpec with Matchers:
       on.copy(authWindowSec = 0)            -> "QOD_REST_AUTH_WINDOW_SEC",
       on.copy(authBlockSec = -1)            -> "QOD_REST_AUTH_BLOCK_SEC",
       on.copy(authFailuresGlobalPerSec = 0) -> "QOD_REST_AUTH_FAILURES_GLOBAL_PER_SEC",
-      on.copy(authThrottleMaxEntries = 0)   -> "QOD_REST_AUTH_THROTTLE_MAX_ENTRIES"
+      on.copy(authThrottleMaxEntries = 0)   -> "QOD_REST_AUTH_THROTTLE_MAX_ENTRIES",
+      on.copy(maxConcurrentPerUser = 0)     -> "QOD_REST_MAX_CONCURRENT_PER_USER",
+      on.copy(maxConcurrentTotal = 0)       -> "QOD_REST_MAX_CONCURRENT_TOTAL"
     )
     cases.foreach { case (cfg, env) =>
       withClue(env) {
