@@ -72,7 +72,9 @@ curl -k -H "Authorization: Bearer qod_pat_..." \
   "https://localhost:31339/api/v1/tenant/acme/database/acme_tpch/schemas/tpch1/tables/customer/rows?select=c_custkey,c_name&c_mktsegment=eq.BUILDING&order=c_custkey&limit=100"
 ```
 
-The four endpoints are `/schemas`, `/schemas/{s}/tables`, `/schemas/{s}/tables/{t}` and `/schemas/{s}/tables/{t}/rows`, all under `/api/v1/tenant/{tenant}/database/{db}`, with filters (`eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `in`, `is`, `not.`), `order`, `limit`/`offset` and, on DuckLake, `asOf`/`asOfTag`/`asOfTs` (every page carries `X-QoD-Snapshot`; send it back as `asOf` for stable paging). Only personal access tokens are accepted, never the static API key or a password: a token with no `--tool` restriction may use the edge, a token restricted with `--tool` must list `rest`. An object the caller may not read answers `404` exactly like a missing one. Put a reverse proxy or WAF that rate-limits per client and per `Authorization` value in front of it before exposing it to the internet.
+The four endpoints are `/schemas`, `/schemas/{s}/tables`, `/schemas/{s}/tables/{t}` and `/schemas/{s}/tables/{t}/rows`, all under `/api/v1/tenant/{tenant}/database/{db}`, with filters (`eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `in`, `is`, `not.`), `order`, `limit`/`offset` and, on DuckLake, `asOf`/`asOfTag`/`asOfTs` (every page carries `X-QoD-Snapshot`; send it back as `asOf` for stable paging). Only personal access tokens are accepted, never the static API key or a password: a token with no `--tool` restriction may use the edge, a token restricted with `--tool` must list `rest`. An object the caller may not read answers `404` exactly like a missing one.
+
+Two abuse controls are built in. A client address that fails authentication more than 20 times a minute is blocked for 5 minutes (`429 too_many_auth_failures`, answered before any token lookup), and each token owner runs at most 4 requests at once however many tokens they mint (`429 too_many_requests`), 64 for the whole edge. Behind a load balancer or reverse proxy, list its addresses in `QOD_REST_TRUSTED_PROXIES` so clients are told apart by `X-Forwarded-For`; otherwise every client shares the proxy's budget. The limits are per manager replica, and a WAF or rate-limiting proxy is still recommended for volumetric and DDoS protection before exposing the edge to the internet.
 
 ![Admin console - live per-node metrics, statement history, Users page](assets/metrics.jpg)
 
@@ -346,6 +348,11 @@ Every scalar in `application.conf` accepts a matching `QOD_*` env-var override. 
 | Metastore password | `QOD_PG_PASSWORD` | `azizam` (change!) |
 | Enable per-statement RBAC | `QOD_ACL_ENABLED` | `false` |
 | Read-only REST data edge (`:31339`) | `QOD_REST_ENABLED` | `false` |
+| REST edge: proxies whose `X-Forwarded-For` is believed | `QOD_REST_TRUSTED_PROXIES` | empty (the TCP peer) |
+| REST edge: failed authentications before a block / window / block length | `QOD_REST_AUTH_FAILURES_PER_WINDOW` / `QOD_REST_AUTH_WINDOW_SEC` / `QOD_REST_AUTH_BLOCK_SEC` | `20` / `60` / `300` |
+| REST edge: failed verifications per second, whole edge | `QOD_REST_AUTH_FAILURES_GLOBAL_PER_SEC` | `50` |
+| REST edge: client addresses tracked by the throttle | `QOD_REST_AUTH_THROTTLE_MAX_ENTRIES` | `100000` |
+| REST edge: in-flight requests per token owner / whole edge | `QOD_REST_MAX_CONCURRENT_PER_USER` / `QOD_REST_MAX_CONCURRENT_TOTAL` | `4` / `64` |
 
 Full reference: [Configuration](https://docs.starlake.ai/qod/reference/configuration).
 

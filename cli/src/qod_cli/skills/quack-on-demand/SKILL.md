@@ -1718,15 +1718,35 @@ Things to know:
 - **Cold pools.** A hibernated pool wakes on the first request; if it is not ready within
   the resume hold (`PROXY_RESUME_HOLD_TIMEOUT_SEC`) the answer is 503 `pool_resuming` with
   `Retry-After: 5`. A statement past `QOD_REST_STMT_TIMEOUT_SEC` answers 504.
-- **Internet exposure requires a reverse proxy or WAF in front of the port that
-  rate-limits per client and per `Authorization` value.** The edge has no per-client
-  throttle of its own yet: every bad token costs a control-plane lookup, and a valid token
-  can run heavy reads concurrently, bounded only by the row and time caps.
+- **Failed-auth throttle.** A client address that fails authentication (401, or 403
+  `forbidden` for a wrong tenant or a token without `rest`) more than
+  `QOD_REST_AUTH_FAILURES_PER_WINDOW` (20) times within `QOD_REST_AUTH_WINDOW_SEC` (60 s) is
+  blocked for `QOD_REST_AUTH_BLOCK_SEC` (300 s): every request from it, even with a valid
+  token, gets 429 `too_many_auth_failures` with `Retry-After`, before any token lookup. A
+  success does not reset the count. Across all clients, more than
+  `QOD_REST_AUTH_FAILURES_GLOBAL_PER_SEC` (50) failing tokens per second get 429 instead of
+  401. Each block is audited as `auth.rest.throttled` (the manager log has a WARN per
+  block). `acl_denied`, 404 and 400 answers never count.
+- **Behind a load balancer or reverse proxy, set `QOD_REST_TRUSTED_PROXIES`.** The client
+  address is the TCP peer, so without it every client shares the proxy's budget and one
+  guessing client blocks them all. List the proxies' addresses as CIDRs
+  (`QOD_REST_TRUSTED_PROXIES=10.0.0.0/8,fd00::/8`); `X-Forwarded-For` is then read from the
+  right, skipping trusted hops, and is ignored from any other peer, so a client cannot
+  pick its own address. IPv6 clients are grouped per /64.
+- **Concurrency cap.** Each token owner runs at most `QOD_REST_MAX_CONCURRENT_PER_USER` (4)
+  requests at once, whatever the number of their tokens, and the edge at most
+  `QOD_REST_MAX_CONCURRENT_TOTAL` (64); past either the answer is 429 `too_many_requests`
+  with `Retry-After: 1`. A request that timed out (504) keeps its slot until the node
+  finishes the statement.
+- **These limits are per manager replica** (with N replicas the effective budget is N
+  times the setting). For internet exposure, a WAF or rate-limiting proxy in front of the
+  port is still recommended for volumetric and DDoS limits.
 - Errors are `{"error": "<code>", "message": "..."}`: 401 `unauthorized` (one body for every
   credential failure), 403 `forbidden` / `acl_denied`, 404 `not_found`, 400
   `invalid_filter` / `unknown_column` / `order_required` / `invalid_parameter`, 406
-  `unsupported_format`, 502 `upstream_error` (the message carries a request id; the
-  node's text is in the manager log at WARN under that id).
+  `unsupported_format`, 429 `too_many_auth_failures` / `too_many_requests`, 502
+  `upstream_error` (the message carries a request id; the node's text is in the manager log
+  at WARN under that id).
 
 ## Hardening (lockdown, pod security, network policy, reader eviction)
 
@@ -1844,6 +1864,8 @@ opt-in except pod security:
 | `/api/*` returns 401 | No valid credential on the call (missing/wrong key, expired session) | `qod login`, or pass `X-API-Key: <key>` on raw REST calls |
 | REST data edge (`:31339`) returns 401 on every call | Not a live PAT of a tenant user: static key, session, superuser-owned or revoked token | Mint a PAT as the tenant user (`qod auth pat create --tool rest ...`) and send `Authorization: Bearer qod_pat_...` |
 | REST data edge returns 403 `forbidden` | Path tenant is not the token's tenant, or the token's `tools` axis lacks `rest` | Fix the URL's tenant, or mint a token with `--tool rest` (or no `--tool` at all) |
+| REST data edge returns 429 `too_many_auth_failures`, even with a valid token | The client address failed authentication more than `QOD_REST_AUTH_FAILURES_PER_WINDOW` times in the window and is blocked for `QOD_REST_AUTH_BLOCK_SEC` | Wait out `Retry-After` and fix the failing client. If EVERY client is blocked at once, the edge sits behind a proxy it does not trust: set `QOD_REST_TRUSTED_PROXIES` to the proxy's CIDRs |
+| REST data edge returns 429 `too_many_requests` | The token owner already has `QOD_REST_MAX_CONCURRENT_PER_USER` requests in flight (all their PATs count together), or the edge `QOD_REST_MAX_CONCURRENT_TOTAL` | Retry after `Retry-After: 1`, run fewer requests in parallel, or raise the cap |
 | `no node with role READONLY or DUAL` | All nodes flipped unhealthy (port unreachable) | Check `pgrep -fl spawn-quack-node`; if 0, run `qod stop` + `qod start` (reconcile respawns) |
 | `access denied: missing RO grant on ...` | ACL is enabled and the user has no matching grant | Add the grant via `qod role permission grant` or set `QOD_ACL_ENABLED=false` |
 | `session expired; please reconnect` | Bearer token unknown (manager restarted between calls) | Re-login or pass Basic credentials |

@@ -24,9 +24,20 @@
   pool_resuming` with `Retry-After`. Responses are `Cache-Control: private` with `Vary:
   Authorization`, and cacheable for five minutes only when pinned to a snapshot. The Helm chart
   gains `rest.enabled` (off by default), `rest.tls.enabled`, a `<release>-rest` Service
-  (`service.restData`) and its NetworkPolicy port; the image exposes `31339`. There is no per-client
-  rate limit yet: an internet-facing edge must sit behind a reverse proxy or WAF that rate-limits
-  per client and per `Authorization` value.
+  (`service.restData`) and its NetworkPolicy port; the image exposes `31339`. Two abuse controls
+  ship with it. A client address that fails authentication more than
+  `QOD_REST_AUTH_FAILURES_PER_WINDOW` (20) times within `QOD_REST_AUTH_WINDOW_SEC` (60) is blocked
+  for `QOD_REST_AUTH_BLOCK_SEC` (300): every request then gets `429 too_many_auth_failures` with
+  `Retry-After`, before any token lookup; a global budget (`QOD_REST_AUTH_FAILURES_GLOBAL_PER_SEC`,
+  50) turns further failing credentials' 401s into 429s, and each block is audited as
+  `auth.rest.throttled`. The address is the TCP peer, or behind a proxy listed in
+  `QOD_REST_TRUSTED_PROXIES` the right-most untrusted `X-Forwarded-For` hop (IPv6 keyed per /64).
+  And each token owner, whatever the number of their PATs, runs at most
+  `QOD_REST_MAX_CONCURRENT_PER_USER` (4) requests at once, `QOD_REST_MAX_CONCURRENT_TOTAL` (64)
+  for the whole edge, past which the answer is `429 too_many_requests`; a slot stays taken until
+  the node work really ends, even after a 504. Both are per manager replica (under HA the effective
+  budget is N times the configured one); a WAF or rate-limiting proxy is still recommended for
+  volumetric and DDoS limits on an internet-facing edge.
 
 ## 0.9.8
 

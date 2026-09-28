@@ -122,6 +122,8 @@ policy gap, the fix goes into the validator or the rewriter, never into a specia
   - row cap `min(maxRows, PAT maxRows, limit)`;
   - timeout `min(stmtTimeoutSec, PAT stmtTimeoutMs)`;
   - a cold-start hold that reuses `resumeHoldTimeoutSec`, then 503 with `Retry-After`.
+- **Abuse controls (O-1, decided for slice 1):** the per-client failed-auth throttle and the
+  per-user in-flight cap of §7.3.
 - **Helm:** the new port and a Service.
 - **Docs:** the block in the configuration reference.
 
@@ -131,15 +133,16 @@ policy gap, the fix goes into the validator or the rewriter, never into a specia
 - **Arrow IPC and Parquet**, streamed.
 - CORS from `corsAllowedOrigins`.
 - Prometheus metrics.
-- *(Proposed, O-1)* abuse controls.
 
 ### 2.4 OPEN items (each needs an answer; a recommendation is given)
 
-**O-1. Abuse controls for direct internet exposure.** Blocks: the scope of slice 2.
+**O-1. Abuse controls for direct internet exposure.** **DECIDED (2026-09-28) and IMPLEMENTED in
+slice 1:** the owner approved both controls for slice 1; §7.3 is now normative.
 
-The maintainer's slices do not include a per-IP failed-auth throttle or a per-user concurrency cap.
-Both are HTTP-layer resource controls, not data policy. Without them, slice 1 relies on the
-deployment for rate limiting.
+The maintainer's original slices did not include a per-IP failed-auth throttle or a per-user
+concurrency cap. Both are HTTP-layer resource controls, not data policy, so they live in the edge's
+server and handler layer (`AuthThrottle`, `UserLimiter`, `ClientAddress` in `edge/rest/`) and never
+touch the policy pipeline.
 
 Guessing a PAT is infeasible: tokens are 32 random bytes (`ondemand/state/PatStore.scala:138-141`).
 What remains is load:
@@ -148,9 +151,9 @@ What remains is load:
 - a valid token can run heavy statements concurrently, bounded only by the row and time caps;
 - the time cap is a bounded wait, not a cancellation (O-4).
 
-*Recommendation:* propose these controls for slice 2, in the form sketched in §7.3. Until they
-land, the operator documentation states that an internet-facing `quack-rest` must sit behind a
-reverse proxy or WAF that rate-limits per client and per `Authorization` value.
+*Outcome:* the controls of §7.3 ship in slice 1. Their state is per replica, so under HA the
+effective budget is N times the configured one. The operator documentation still recommends a WAF
+or rate-limiting proxy for volumetric and DDoS limits, which no in-process control can absorb.
 
 **O-2. Where the configuration reference lives.** Blocks: the slice 1 docs task.
 
@@ -653,21 +656,62 @@ These are HTTP-layer defaults, not data policy.
   currently drops the late result.
 - The node keeps running either way (O-4).
 
-### 7.3 Proposed for slice 2 (O-1): minimal abuse controls
+### 7.3 Abuse controls (O-1, normative, slice 1)
 
-These are not in the maintainer's slices; they are offered for agreement.
+HTTP-layer resource controls, not data policy: they wrap the pipeline and never change what a
+principal may read. All state is per replica: under HA the effective budget is N times the
+configured one. A WAF or rate-limiting proxy remains the answer to volumetric and DDoS load.
 
-- **Per-IP throttle on failed authentication:**
-  - The client IP is the TCP peer. `X-Forwarded-For` is honoured only when the peer is in
-    `trustedProxies`, and is read from the right.
-  - IPv4-mapped addresses are normalised. IPv6 addresses are keyed per /64.
-  - After N 401s within the window, the IP gets 429 before any credential lookup.
-  - A global budget catches distributed attempts. Entries that are currently blocking are never
-    evicted.
-- **Per-user in-flight cap**, keyed by `(tenant, userId)` so that minting more PATs does not buy
-  more slots. A slot is released only when the node call has actually finished.
+**Client key** (`ClientAddress`, pure):
 
-Until then, the operator documentation requires a reverse proxy or WAF for internet exposure (O-1).
+- The key is the TCP peer.
+- `X-Forwarded-For` is read only when the peer is in `trustedProxies` (CIDRs, IPv4 and IPv6,
+  empty by default). It is walked from the RIGHT and the first hop that is not itself a trusted
+  proxy is the key; when every hop is trusted, the left-most one. An empty header, or an
+  unparsable hop met on the way, falls back to the peer. Hops left of the first untrusted one are
+  never read, so a client outside the trusted set can never choose its key.
+- IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is keyed as IPv4; native IPv6 per /64.
+- The fleet heartbeat's resolver answers "unknown" in those fallback cases instead, on purpose:
+  there the address grants approval; here it only buckets failures.
+
+**Failed-auth throttle** (`AuthThrottle`, clock injected):
+
+- It counts, per client key, every authentication failure: every 401, and the two 403 `forbidden`
+  answers that judge the credential (the token's tenant is not the path's; the tools axis lacks
+  `rest`). It never counts an authenticated principal's `acl_denied`, 404 or 400; the per-user
+  cap bounds those.
+- A sliding window: more than `authFailuresPerWindow` (20) failures within `authWindowSec` (60)
+  block the key for `authBlockSec` (300). The failure that crosses the allowance is itself
+  answered 429. While blocked, EVERY request from the key gets 429 `too_many_auth_failures` with
+  `Retry-After` (the seconds left), answered before any credential is parsed or looked up: by
+  `RestEdgeServer` before routing (every path and method), and again by the handlers. A success
+  does not reset the count.
+- A global token bucket over failed credential verifications (`authFailuresGlobalPerSec`, 50,
+  same capacity): when it is empty, a request whose credential fails gets 429
+  `too_many_auth_failures` (`Retry-After: 1`) instead of 401. Valid credentials are unaffected.
+- Memory is bounded. Counters live in a Caffeine cache of `authThrottleMaxEntries` (100 000)
+  entries; evicting one may forget partial progress, never a block. Blocks live in a separate map
+  of the same capacity and are never dropped before they expire, except that when it is full the
+  block that expires first is dropped; an offender past that is still covered by the global
+  bucket.
+- Audit: each new block is logged at WARN with its key and recorded as `auth.rest.throttled`
+  (actor `anonymous`, family `auth`, origin `rest`, `source` = the key), like the manager's
+  anonymous 401s. The `AuditRateLimiter` is keyed by one constant (one row per second at most),
+  because a run rotating fresh keys could otherwise turn blocks into synchronous audit writes.
+
+**Per-user in-flight cap** (`UserLimiter`):
+
+- Keyed by `(tenant, userId)` of the PAT's owner, never by the PAT, so minting more tokens buys no
+  extra slots. At most `maxConcurrentPerUser` (4) slots per user and `maxConcurrentTotal` (64) for
+  the edge; beyond either, 429 `too_many_requests` with `Retry-After: 1`.
+- One request takes ONE slot, after authentication and target resolution and before the first
+  executor call, shared by the probe and the data statement (or a listing's statements).
+- The slot is freed only when the node work has finished. It is reference-counted: the request
+  holds a share until it ends, and every executor call retains a share (in
+  `BoundedWait.closingLate`'s `beforeStart`, uncancelably, just before the statement's fiber
+  starts) that is released when the call fails or raises, or when its result is closed, by the
+  reader's finalizer or, after a 504 or a client disconnect, by the bounded wait's late close.
+  Every release is idempotent, so a double release never raises the cap.
 
 ### 7.4 Hibernated pools
 
@@ -723,6 +767,23 @@ quack-rest {
   headerReceiveTimeoutSec = ${?QOD_REST_HEADER_RECEIVE_TIMEOUT_SEC}
   idleTimeoutSec = 60
   idleTimeoutSec = ${?QOD_REST_IDLE_TIMEOUT_SEC}
+  # O-1 abuse controls (§7.3); per replica
+  trustedProxies = ""
+  trustedProxies = ${?QOD_REST_TRUSTED_PROXIES}
+  authFailuresPerWindow = 20
+  authFailuresPerWindow = ${?QOD_REST_AUTH_FAILURES_PER_WINDOW}
+  authWindowSec = 60
+  authWindowSec = ${?QOD_REST_AUTH_WINDOW_SEC}
+  authBlockSec = 300
+  authBlockSec = ${?QOD_REST_AUTH_BLOCK_SEC}
+  authFailuresGlobalPerSec = 50
+  authFailuresGlobalPerSec = ${?QOD_REST_AUTH_FAILURES_GLOBAL_PER_SEC}
+  authThrottleMaxEntries = 100000
+  authThrottleMaxEntries = ${?QOD_REST_AUTH_THROTTLE_MAX_ENTRIES}
+  maxConcurrentPerUser = 4
+  maxConcurrentPerUser = ${?QOD_REST_MAX_CONCURRENT_PER_USER}
+  maxConcurrentTotal = 64
+  maxConcurrentTotal = ${?QOD_REST_MAX_CONCURRENT_TOTAL}
   # slice 2: corsAllowedOrigins (QOD_REST_CORS_ALLOWED_ORIGINS)
 }
 ```
@@ -733,8 +794,9 @@ quack-rest {
 - **`ConfigRegistry.rootsFor`.** Add an entry. That is what makes the block appear in the generated
   configuration reference (O-2).
 - **Boot validation** covers only the numbers (`defaultLimit >= 1`, `maxRows >= defaultLimit`, and
-  so on) and a port that clashes with another door. It follows the `Either[String, Unit]` pattern
-  of `HaPreconditions.validate`.
+  so on), a port that clashes with another door, and the O-1 keys: every number must be positive
+  and `trustedProxies` must parse, each error naming its env var. It follows the
+  `Either[String, Unit]` pattern of `HaPreconditions.validate`.
 
 ### 8.3 Boot, banner, shutdown, Helm
 
@@ -806,11 +868,12 @@ quack-rest {
 | T4 | Enumerating databases, schemas, tables or tags | The same 404 for missing and for not granted. An empty schema gets 404. Tags are never echoed. Discovery is filtered by grants. | H5, D1-D4 |
 | T5 | Policy bypass (RLS, CLS, the masked-column oracle, positional references) | One pipeline. No positional references are generated. S1 and S3 are pinned, and fixed in the rewriter if needed. | P1, P2 |
 | T6 | Leaving the tenant catalog | Three-part names from a single catalog resolver. S7. | P8, P9 |
-| T7 | Resource exhaustion | Row, time, filter, size and wildcard caps. Ember limits. Late results are closed. O-1 for rate limiting. | U1, H8, H9 |
+| T7 | Resource exhaustion | Row, time, filter, size and wildcard caps. Ember limits. Late results are closed. The per-user and edge-wide in-flight cap, whose slot outlives a 504 until the node work ends (§7.3). A WAF for volumetric load. | U1, U10, H8, H9, H14 |
 | T8 | Cache leakage across principals | `Cache-Control: private` and `Vary: Authorization` everywhere | H1 |
 | T9 | Tokens or personal data in logs and errors | Neither `Authorization` nor parameter values are logged. Fixed error messages. Sanitised names. | H10, H12 |
 | T10 | Request desync, slowloris | A GET with a body is refused. A header receive timeout. | H9 |
 | T11 | ACL accidentally off | A banner warning (Q4). Discovery still fails closed through filtered metadata. | U6 |
+| T12 | Credential flooding (control-plane load), and a spoofed `X-Forwarded-For` to dodge or aim it | The failed-auth throttle, answered before any PAT lookup, plus a global failure bucket; the key is the TCP peer, `X-Forwarded-For` only from `trustedProxies`, read from the right (§7.3). Counters bounded, blocks never evicted early. | U8, U9, H13, H15 |
 
 ---
 
@@ -886,6 +949,25 @@ column name, checked by three oracles:
 - `format` wins over `Accept`.
 - `arrow` and `parquet` get 406 in slice 1.
 - The fallback is JSON.
+
+**U8: client key** (`ClientAddressSpec`). An untrusted peer with `X-Forwarded-For` is keyed by the
+peer; behind a trusted proxy, the right-most untrusted hop; all hops trusted, the left-most; a
+missing, empty or malformed header, the peer; IPv4-mapped IPv6 as IPv4; native IPv6 per /64.
+
+**U9: failed-auth throttle** (`AuthThrottleSpec`, injected clock). It blocks at failure N+1, not
+N; a success does not reset; the block expires; the window slides; a blocked key survives churn of
+200 000 other keys (Caffeine built with a same-thread executor, `cleanUp()` before asserting); a
+full blocked set drops the block that expires first; the global bucket holds and refills
+`authFailuresGlobalPerSec`; exactly the 401 and the two credential 403s count; a block is audited
+once, rate-limited.
+
+**U10: in-flight cap** (`UserLimiterSpec`). Both caps; per user, not per tenant; an idempotent
+release; a slot held until the request and every retained share let go; 10 000 seeded random
+acquire, retain and release sequences leak no slot and never exceed a cap. `BoundedWaitSpec` pins
+that `beforeStart` runs exactly once, before the statement, even for a cancelled caller.
+
+`RestEdgeConfigSpec` (U6) also pins the O-1 defaults, the refusal of every non-positive value and
+of an unparsable `trustedProxies`, each naming its env var.
 
 ### 11.2 The edge over the executor seam, without the wire (H): `RestEdgeHandlersSpec`
 
@@ -968,6 +1050,30 @@ Tapir too. A client's `X-Request-Id` is not echoed.
 
 **H12: upstream errors.** A stub that throws a secret-looking message produces a 502 that carries
 the request id but not the message.
+
+**H13: failed-auth throttle** (`RestEdgeHandlersSpec`, the resolver counts its lookups).
+
+- 20 failures from a key answer 401; the 21st answers 429 and blocks the key; the next request,
+  with a VALID token, is 429 with `Retry-After` and no PAT lookup happens. Another key is served.
+- The wrong-tenant and tools-axis 403s count the same way.
+- `acl_denied`, 404 and 400 floods from an authenticated principal are never throttled.
+- Once the global bucket is empty, a failing credential gets 429 instead of 401 and a valid one
+  is still served.
+
+**H14: in-flight cap** (`RestEdgeHandlersSpec`, latched stubs).
+
+- 5 parallel requests with the default cap of 4: exactly one 429 `too_many_requests` with
+  `Retry-After: 1`, and it never reaches the executor.
+- Two PATs of the same owner share one budget; another owner's does not; the edge-wide cap
+  applies across owners.
+- A 504 keeps the slot until the stub completes, then frees it exactly once (the cap is still
+  exactly one slot afterwards).
+- A disconnect during the node call, and a disconnect mid-stream (a reader latched between
+  batches), each free the slot exactly once, through the late close and the reader's finalizer.
+
+**H15: client key on the wire** (`RestEdgeServerSpec`). An untrusted `X-Forwarded-For` is ignored;
+with `trustedProxies=127.0.0.1/32` different `X-Forwarded-For` clients get separate budgets; a
+blocked key gets 429 on every path and method, with the edge headers.
 
 ### 11.3 Discovery fails closed (D): `RestDiscoveryScopeSpec`, in the style of `RbacTenantScopeSpec`
 
@@ -1052,6 +1158,7 @@ End-to-end cases:
 | 1c | The pure core: `RestQuery`, `RestSql`, the encoder, format negotiation. Tests U1-U7. | S8 |
 | 1d | `RestEdgeHandlers`, `RestEdgeServer`, config, banner, wiring, shutdown, and endpoint registration with the guards (§8.4). Tests H1-H12, D1-D4, E1-E8. | S1-S3, S5-S7 |
 | 1e | Helm port and Service; Dockerfile and compose; the configuration-reference block (O-2); README ports and section; CLAUDE.md (four sockets become five); a CHANGELOG entry; the operator skill and its bundled copy, including the O-1 deployment requirement. | 1d |
+| 1f | The O-1 abuse controls of §7.3 (client key, failed-auth throttle, per-user in-flight cap), their config keys, tests U8-U10 and H13-H15, and the docs. The Helm chart passes no comparable edge setting through values, so `trustedProxies` is set by env var there too. | owner approval of O-1 |
 
 **PR 2 (slice 2):**
 
@@ -1061,7 +1168,6 @@ End-to-end cases:
 | 2b | Arrow IPC and Parquet, streamed. Parquet needs either a writer dependency or a node-side `COPY`; decide in the PR. Abort the connection on an error after the first byte. | PR 1 merged |
 | 2c | CORS (`corsAllowedOrigins`): exact origins or `*`, never credentials, `Vary: Origin`. | PR 1 merged |
 | 2d | Prometheus metrics (§9). | PR 1 merged |
-| 2e | The O-1 abuse controls, **only if the maintainer agrees**. | maintainer |
 
 ---
 
@@ -1109,6 +1215,6 @@ End-to-end cases:
 | The edge authorized before resolving the snapshot (a `preAuthorized` path and an extracted `RoutedExecutor`) | Authorization stays inside `routedExecutor`; the snapshot follows the preview rules | Keep the edge a thin translator |
 | A `source` column in history and a `source` metrics tag | `source` passed to `executeWith` only, as the native door does | Constraint 5 |
 | A standalone `/api/v1/openapi.json` | Endpoints registered in `EndpointModules` for `GenOpenApi` | Constraint 6 |
-| A per-IP throttle and a per-user cap in v1 | Proposed for slice 2 (O-1); a WAF is required until then | Not in the maintainer's slices |
+| A per-IP throttle and a per-user cap in v1 | Proposed for slice 2 (O-1), then approved by the owner for slice 1 (§7.3); a WAF is still recommended for volumetric limits | Not in the maintainer's original slices |
 | Arrow in v1, Parquet parked | Arrow and Parquet in slice 2, streamed | Slicing |
 | `Cache-Control: no-store` | `private` + `Vary: Authorization`, with `max-age` only for pinned snapshots | Cacheable GET resources are the point of this door (§1.1) |
