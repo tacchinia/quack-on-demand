@@ -56,7 +56,21 @@ object SqlParser:
     * and single-quoted literals or double-quoted identifiers inside the group may contain parens
     * without desyncing the depth counter.
     */
-  def stripTimeTravelClauses(sql: String): String =
+  def stripTimeTravelClauses(sql: String): String = timeTravelClauses(sql)._1
+
+  /** One clause removed by [[timeTravelClauses]]: its verbatim text (`AT (VERSION => 3)`) and the
+    * offset in the STRIPPED text where it stood. The whitespace around a clause is kept, so the
+    * offset sits right after the whitespace that followed the table reference (and its alias).
+    */
+  final case class TimeTravelClause(at: Int, text: String)
+
+  /** [[stripTimeTravelClauses]] plus the clauses it removed, in source order. The one scanner
+    * behind both: the column and row policy rewriters strip with it and put each clause back on its
+    * table reference (`TimeTravelCarrier`), so what they parse is exactly what the validator
+    * parsed.
+    */
+  def timeTravelClauses(sql: String): (String, List[TimeTravelClause]) =
+    val removed                       = List.newBuilder[TimeTravelClause]
     val out                           = new StringBuilder
     var i                             = 0
     val n                             = sql.length
@@ -111,12 +125,15 @@ object SqlParser:
       then
         var j = i + 2
         while j < n && sql(j).isWhitespace do j += 1
-        if j < n && sql(j) == '(' && timeTravelGroup(j) then i = skipGroup(j)
+        if j < n && sql(j) == '(' && timeTravelGroup(j) then
+          val end = skipGroup(j)
+          removed += TimeTravelClause(out.length, sql.substring(i, end))
+          i = end
         else
           out.append(c); i += 1
       else
         out.append(c); i += 1
-    out.toString
+    (out.toString, removed.result())
 
   /** Extract table references from a SQL string that may contain multiple statements.
     *
