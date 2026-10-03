@@ -339,17 +339,18 @@ final class FlightSqlRouter(
         */
       adminDispatch: Boolean = true,
       /** Audit origin recorded on denial and write events and on the SessionOpened module event:
-        * `"flightsql"` for the raw wire, `"quack"` for the native Quack front door. Independent of
-        * `edge` below: metering and audit must not move when a caller only wants to tag the OPA
-        * input differently.
+        * `"flightsql"` for the raw wire, `"quack"` for the native Quack front door, `"rest-data"`
+        * for the REST data edge (through the routed executor). Independent of `edge` below:
+        * metering and audit must not move when a caller only wants to tag the OPA input
+        * differently.
         */
       source: String = "flightsql",
       /** OPA `client.edge`, forwarded to [[executeWith]]'s `ValidationContext.edge` ONLY. Empty
         * (the default) means "same as `source`" -- resolved in [[executeWith]], not here: a
-        * parameter default cannot reference a sibling parameter of the same list in Scala. Main's
-        * routed executor passes `edge = "mcp"` while leaving `source` at its own default so REST
-        * preview / data diff / restore / undrop / branch counts keep reporting "flightsql" for
-        * metering and audit.
+        * parameter default cannot reference a sibling parameter of the same list in Scala. The
+        * routed executor passes its caller's `edge` (`"mcp"` unless the caller names another) while
+        * leaving `source` at the caller's own, so REST preview / data diff / restore / undrop /
+        * branch counts keep reporting "flightsql" for metering and audit.
         */
       edge: String = ""
   ): IO[Either[RouterFailure, QueryResult]] =
@@ -411,9 +412,9 @@ final class FlightSqlRouter(
     * through [[execute]].
     *
     * `source` is the audit origin recorded on denial and write events and on the SessionOpened
-    * module event (`"flightsql"` or `"quack"`). `edge` is the OPA `client.edge` value used ONLY for
-    * `ValidationContext.edge`; empty (the default) means "same as `source`" and is otherwise
-    * independent of it (see `execute`'s scaladoc).
+    * module event (`"flightsql"`, `"quack"` or `"rest-data"`). `edge` is the OPA `client.edge`
+    * value used ONLY for `ValidationContext.edge`; empty (the default) means "same as `source`" and
+    * is otherwise independent of it (see `execute`'s scaladoc).
     */
   def executeWith[A](
       connectionId: String,
