@@ -1,6 +1,8 @@
 package ai.starlake.quack.edge.cls
 
 import java.util.Locale
+import ai.starlake.quack.edge.policy.TimeTravelCarrier
+import ai.starlake.quack.edge.policy.TimeTravelCarrier.Carry
 import ai.starlake.quack.model.StatementKind
 import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import cats.effect.IO
@@ -72,7 +74,22 @@ final class ColumnPolicyRewriter(
     else if eff.user.tenant.isEmpty then IO.pure(Passthrough)
     else if kind != StatementKind.Select then IO.pure(Passthrough)
     else if eff.columnPolicies.isEmpty then IO.pure(Passthrough)
-    else if readsOnlyCatalogFunctions(sql) then IO.pure(Passthrough)
+    else
+      // A time-travel clause is invisible to jsqlparser: carry it through the rewrite on its
+      // table reference and put it back afterwards (TimeTravelCarrier). A Passthrough forwards the
+      // caller's original text, clause included, so only a rewrite needs the restore.
+      TimeTravelCarrier.carry(sql) match
+        case Carry.Absent                    => rewriteParseable(sql, eff, ctx)
+        case Carry.Unplaceable               => IO.pure(PassthroughParseFailed)
+        case Carry.Carried(carried, clauses) =>
+          rewriteParseable(carried, eff, ctx).map {
+            case Rewritten(s) =>
+              TimeTravelCarrier.restore(s, clauses).fold(PassthroughParseFailed)(Rewritten(_))
+            case other => other
+          }
+
+  private def rewriteParseable(sql: String, eff: EffectiveSet, ctx: SchemaContext): IO[Outcome] =
+    if readsOnlyCatalogFunctions(sql) then IO.pure(Passthrough)
     else
       buildSchema(sql, ctx).map { schema =>
         PositionalReferences.resolve(sql, schema) match
