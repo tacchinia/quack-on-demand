@@ -71,6 +71,7 @@ OCI publication to a public registry is a planned follow-up.
 | `Deployment` | The manager pod. Default `replicas: 1` (see the Resilience guide at https://starlake-ai.github.io/quack-on-demand/operating/resilience and #11). |
 | `Service` (REST) | ClusterIP on `:20900` for `/api`, `/ui`, `/metrics`. |
 | `Service` (FlightSQL) | ClusterIP on `:31338` for the Arrow Flight gRPC edge. |
+| `Service` (REST data) | `<release>-rest`, ClusterIP on `:31339` for the read-only REST data edge (`GET /api/v1/...`, PAT bearer). Only when `rest.enabled`. |
 | `ServiceAccount` | Bound to the `Role` below. |
 | `Role` + `RoleBinding` | Pods + services CRUD in the manager's own namespace. **Not a `ClusterRole`** - the manager only ever talks to its own namespace. |
 | `ConfigMap` | `QOD_*` / `PROXY_*` env-var overrides - everything in `application.conf` that isn't a secret. |
@@ -94,6 +95,9 @@ See [`values.yaml`](values.yaml) for the full list. The most-used:
 | `apiKey.value` | `""` | Static `X-API-Key` for `/api/*`. Optional - UI login still works without it. |
 | `flightsql.tls.enabled` | `true` | Manager auto-generates a self-signed cert at boot when no Secret is mounted. |
 | `service.flightsql.type` | `ClusterIP` | Override to `LoadBalancer` / `NodePort` to expose externally. |
+| `rest.enabled` | `false` | Read-only REST data edge on `:31339` (`QOD_REST_ENABLED`), with its Service and NetworkPolicy port. PATs only. Internet exposure requires a reverse proxy or WAF that rate-limits per client and per `Authorization` value. |
+| `rest.tls.enabled` | `true` | `QOD_REST_TLS_ENABLED`; reuses the Flight edge's PEM pair. |
+| `service.restData.type` | `ClusterIP` | The REST data edge Service (`service.rest` is the admin REST/UI one). |
 | `ingress.enabled` | `false` | REST/UI only. |
 | `serviceMonitor.enabled` | `false` | Set true when you run Prometheus Operator. |
 | `metrics.sink` | `prometheus` | One of `prometheus` \| `aws` \| `azure` \| `gcp` \| `none`. |
