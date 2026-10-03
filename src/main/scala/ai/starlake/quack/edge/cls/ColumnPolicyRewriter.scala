@@ -181,7 +181,7 @@ final class ColumnPolicyRewriter(
         val finder = new net.sf.jsqlparser.util.TablesNamesFinder()
         finder.getTableList(stmt: net.sf.jsqlparser.statement.Statement).asScala.toList
       }.getOrElse(Nil)
-    def unquote(s: String) = s.stripPrefix("\"").stripSuffix("\"")
+    import JsqltranspilerRewriter.unquote
     names.flatMap { raw =>
       raw.split('.').toList.map(unquote) match
         case tab :: Nil =>
