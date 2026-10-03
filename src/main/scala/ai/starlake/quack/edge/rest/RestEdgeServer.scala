@@ -18,7 +18,7 @@ import org.http4s.{Header, HttpApp, HttpRoutes, MediaType, Method, Request, Resp
 import org.http4s.ember.core.EmberException
 import org.http4s.ember.server.EmberServerBuilder
 import org.http4s.headers.{`Content-Type`, Connection}
-import org.typelevel.ci.CIStringSyntax
+import org.typelevel.ci.{CIString, CIStringSyntax}
 import sttp.tapir.server.ServerEndpoint
 import sttp.tapir.server.http4s.Http4sServerInterpreter
 
@@ -38,6 +38,9 @@ import scala.util.Try
   *   - the Ember limits. The pinned http4s (0.23.24) has all four knobs, so there is no gap:
   *     `withMaxHeaderSize` (bounds the request line, so the URI, too), the header receive timeout
   *     (slowloris), the idle timeout and `withMaxConnections`;
+  *   - the trailer fields of a streamed answer, which Tapir cannot express: the route leaves them
+  *     in the request's [[RestTrailers]] slot and they are attached here, written by Ember after
+  *     the last chunk;
   *   - a fresh `X-Request-Id` per request, set on the request the handlers read (a client's own is
   *     replaced, never echoed) and on every response, including the ones Ember itself generates for
   *     an unparseable or oversized request head;
@@ -48,7 +51,7 @@ import scala.util.Try
   */
 final class RestEdgeServer(
     cfg: RestEdgeConfig,
-    endpoints: List[ServerEndpoint[Any, IO]],
+    endpoints: List[ServerEndpoint[RestEdgeEndpoints.Caps, IO]],
     newRequestId: () => String = () => UUID.randomUUID().toString,
     /** The failed-auth throttle, the SAME instance the handlers record failures in. */
     throttle: Option[AuthThrottle] = None
@@ -134,14 +137,16 @@ final class RestEdgeServer(
 
   /** The whole app: request id, gates, routes, headers; an escaped error is a decorated 500. */
   val app: HttpApp[IO] = Kleisli { (req0: Request[IO]) =>
-    val rid    = newRequestId()
-    val client = clientOf(req0)
-    val accept = req0.headers.get(ci"Accept").map(_.toList.map(_.value).mkString(","))
+    val rid      = newRequestId()
+    val client   = clientOf(req0)
+    val trailers = new RestTrailers
+    val accept   = req0.headers.get(ci"Accept").map(_.toList.map(_.value).mkString(","))
     // `putHeaders` replaces: a client's own X-Request-Id never reaches the handlers.
     val base = req0
       .removeHeader(ci"Accept")
       .putHeaders(Header.Raw(ci"X-Request-Id", rid))
       .withAttribute(RestEdgeEndpoints.ClientAttribute, client)
+      .withAttribute(RestEdgeEndpoints.TrailersAttribute, trailers)
     val req    = accept.fold(base)(a => base.withAttribute(RestEdgeEndpoints.AcceptAttribute, a))
     val routed = blocked(client).orElse(gate(req)) match
       case Some(refused) => IO.pure(refused)
@@ -151,8 +156,15 @@ final class RestEdgeServer(
         logger.warn(s"rest [$rid] unhandled failure: ${t.getClass.getName}")
         error(Status.InternalServerError, "upstream_error", s"upstream error (request id $rid)")
       }
-      .map(decorate(_, rid))
+      .map(resp => withTrailers(decorate(resp, rid), trailers))
   }
+
+  private def withTrailers(resp: Response[IO], slot: RestTrailers): Response[IO] =
+    slot.get.fold(resp)(fields =>
+      resp.withTrailerHeaders(
+        fields.map(hs => org.http4s.Headers(hs.map(h => Header.Raw(CIString(h.name), h.value))))
+      )
+    )
 
   private def tooLarge: Response[IO] =
     error(Status.RequestHeaderFieldsTooLarge, "invalid_request", "request head exceeds the limit")
@@ -244,29 +256,40 @@ object RestEdgeServer:
   private val StorePass: Array[Char] = "qod-rest-tls".toCharArray
 
   /** The four routes bound to the handlers. */
-  def serverEndpoints(h: RestEdgeHandlers): List[ServerEndpoint[Any, IO]] =
+  def serverEndpoints(h: RestEdgeHandlers): List[ServerEndpoint[RestEdgeEndpoints.Caps, IO]] =
     List(
       RestEdgeEndpoints.listSchemas.serverLogic { case (t, db, req) =>
-        h.schemas(t, db, req).map(toTapir)
+        h.schemas(t, db, req).map(toTapir(req))
       },
       RestEdgeEndpoints.listTables.serverLogic { case (t, db, s, req) =>
-        h.tables(t, db, s, req).map(toTapir)
+        h.tables(t, db, s, req).map(toTapir(req))
       },
       RestEdgeEndpoints.describeTable.serverLogic { case (t, db, s, tb, req) =>
-        h.table(t, db, s, tb, req).map(toTapir)
+        h.table(t, db, s, tb, req).map(toTapir(req))
       },
       RestEdgeEndpoints.readRows.serverLogic { case (t, db, s, tb, req) =>
-        h.rows(t, db, s, tb, req).map(toTapir)
+        h.rows(t, db, s, tb, req).map(toTapir(req))
       }
     )
 
-  /** A body goes out as the encoder's own bytes, with their `Content-Length`. */
-  private[rest] def toTapir(
+  /** A buffered body goes out with its `Content-Length`; a streamed one goes out chunked, its
+    * trailers handed to the server through the request's slot.
+    */
+  private[rest] def toTapir(req: RestRequest)(
       out: Either[RestEdgeHandlers.Failure, RestOk]
   ): Either[RestEdgeEndpoints.Error, (List[sttp.model.Header], RestEdgeEndpoints.Body)] =
-    out.map(ok =>
-      (ok.headers :+ sttp.model.Header("Content-Length", ok.bytes.length.toString), ok.bytes.buffer)
-    )
+    out.map { ok =>
+      ok.content match
+        case RestBody.Buffered(bytes) =>
+          // The encoder's own buffer, wrapped rather than copied.
+          (
+            ok.headers :+ sttp.model.Header("Content-Length", bytes.length.toString),
+            fs2.Stream.chunk(fs2.Chunk.byteBuffer(bytes.buffer))
+          )
+        case RestBody.Streamed(bytes, trailers) =>
+          req.trailers.set(trailers)
+          (ok.headers, bytes)
+    }
 
   private def isLoopback(host: String): Boolean =
     host == "localhost" || Try(InetAddress.getByName(host).isLoopbackAddress).getOrElse(false)
