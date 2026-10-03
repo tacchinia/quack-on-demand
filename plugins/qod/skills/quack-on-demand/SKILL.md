@@ -1894,11 +1894,21 @@ which also creates the `<release>-rest` Service). Port `31339` (`QOD_REST_PORT`)
 default with the FlightSQL edge's certificate (`QOD_REST_TLS_ENABLED=false` for plain HTTP
 on a trusted network only). The boot banner prints a `REST (data)` line when it is up.
 
-**Credentials: personal access tokens only.** Never the static `X-API-Key`, a session
-cookie, HTTP Basic or `?access_token=`. A superuser's token is refused (401): mint it from a
-tenant user. The URL's tenant must be the token owner's tenant (otherwise 403 `forbidden`).
-The token's `tools` axis must be unrestricted or include `rest`; its `databases`, `pools`
-and `maxRows` / `stmtTimeoutMs` axes apply as everywhere else.
+**Credentials: a personal access token, or a token of the tenant's own OIDC provider.** Never the
+static `X-API-Key`, a session cookie, HTTP Basic or `?access_token=`. A superuser's token is
+refused (401): mint it from a tenant user. The URL's tenant must be the token owner's tenant
+(otherwise 403 `forbidden`). The token's `tools` axis must be unrestricted or include
+`rest`; its `databases`, `pools` and `maxRows` / `stmtTimeoutMs` axes apply as everywhere
+else.
+
+A tenant whose users sign in through its OWN OIDC provider (`qod tenant set-auth ...`:
+keycloak, google, azure or aws with a per-tenant client) can also send an ID token of that
+provider (or an access token whose audience is the tenant's client id) as the bearer. It is
+checked by that tenant's provider only (issuer, audience,
+signature), never by the manager-wide providers; it must carry `exp`; and the user it names
+(`preferred_username`, else `email`, else `sub`) must exist and be enabled in the tenant.
+Its roles and groups widen the user's grants by name, as on FlightSQL. A tenant without its
+own provider answers 401 to any JWT.
 
 ```bash
 # 1. As the tenant user who will read (or an admin minting for a service user's session):
@@ -1916,13 +1926,18 @@ curl -k -H "Authorization: Bearer $TOKEN" \
 
 # CSV instead of JSON
 curl -k -H "Authorization: Bearer $TOKEN" "$BASE/schemas/tpch1/tables/orders/rows?limit=10&format=csv"
+
+# Arrow IPC or Parquet, streamed (rows only)
+curl -k -H "Authorization: Bearer $TOKEN" -o orders.arrow "$BASE/schemas/tpch1/tables/orders/rows?limit=50000&format=arrow"
+curl -k -H "Authorization: Bearer $TOKEN" -o orders.parquet "$BASE/schemas/tpch1/tables/orders/rows?limit=50000&format=parquet"
 ```
 
 `/rows` parameters:
 
 - `select=a,b` (default: every column the caller may see), `order=a.desc.nullslast,b`,
   `limit` (default `QOD_REST_DEFAULT_LIMIT`, 1000), `offset` (needs `order`), `pool=<name>`,
-  `format=json|csv` (or the `Accept` header).
+  `format=json|csv|arrow|parquet` (or the `Accept` header; the listings and the table
+  detail serve json and csv only, anything else is 406).
 - Filters: `<column>=<op>.<value>` with `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`,
   `ilike` (`*` is the wildcard, at most 4), `in.(a,b,"c,d")`, `is.null|true|false`, each
   negatable with `not.` (`status=not.in.(X,Y)`). Repeating a filter ANDs it.
@@ -1937,6 +1952,24 @@ curl -k -H "Authorization: Bearer $TOKEN" "$BASE/schemas/tpch1/tables/orders/row
   `min(limit, QOD_REST_MAX_ROWS, the token's maxRows)`, and a page is cut at a row
   boundary once its body would pass `QOD_REST_MAX_RESPONSE_BYTES` (64 MiB), also flagged
   `X-QoD-Truncated`.
+- Arrow (`application/vnd.apache.arrow.stream`) and Parquet (`application/vnd.apache.parquet`)
+  are streamed with bounded memory. Page them with `X-QoD-Limit`, sent up front: it is the
+  effective row limit
+  `min(limit, or QOD_REST_DEFAULT_LIMIT when absent; quack-rest.maxRows; token maxRows)`, and a page
+  holding that many rows may continue. `Content-Range` and `X-QoD-Truncated` also come, as
+  HTTP TRAILERS after the body, but browsers and many clients and proxies drop trailers, so
+  do not rely on them. The byte cap is checked between batches: a stream that reaches it with
+  rows left is ABORTED (the connection drops, the body never ends cleanly), so lower `limit`
+  until a page fits under `QOD_REST_MAX_RESPONSE_BYTES`; a Parquet page that outgrows it
+  before its first byte answers 400 `invalid_parameter`. An answer still running
+  `QOD_REST_MAX_STREAM_SEC` (600 s) after its result arrived (a slow reader, or a stalled
+  node) is aborted too, or answered 504 if its first batch has not come; a read stalled
+  inside the embedded node client (`QOD_NATIVE_CLIENT=false`) holds the request's slot until
+  the node answers. At most `QOD_REST_MAX_CONCURRENT_PARQUET` (2) Parquet bodies stream at
+  once, one per user (429 `too_many_requests` past either). Views keep their rules in these formats too. A body that
+  breaks after the first byte means the transfer failed or was cut by a cap; retry, with a
+  smaller `limit` if it was the cap. Parquet is not offered when the manager runs on Windows
+  (406).
 
 Things to know:
 
@@ -1980,17 +2013,53 @@ Things to know:
   than the hold, or the manager refuses to boot; a request to a cold pool that the edge's
   own wait cuts short still answers 503 `pool_resuming`. On a warm pool a statement past
   that wait answers 504. Every 503 carries `Retry-After`.
-- **Internet exposure requires a reverse proxy or WAF in front of the port that
-  rate-limits per client and per `Authorization` value.** The edge has no per-client
-  throttle or per-user concurrency cap of its own yet (they come in a later change): every
-  bad token costs a control-plane lookup, and a valid token can run heavy reads
-  concurrently, bounded only by the row, byte and time caps.
+- **Browser apps (CORS).** Off by default. `QOD_REST_CORS_ALLOWED_ORIGINS` lists exact
+  origins (`https://app.example.com,http://localhost:5173`) or `*`; a malformed entry stops
+  the manager at boot. Allowed origins may send `GET` with `Authorization` and `Accept`, and
+  read `X-QoD-Snapshot`, `X-QoD-Truncated`, `X-QoD-Limit`, `Content-Range`, `X-Request-Id`
+  and `Retry-After`. Credentials (cookies) are never allowed: the app sends the token itself.
+  A preflight from a client the failed-auth throttle has blocked gets its 429 without
+  `Access-Control-Allow-Origin`, so the browser reports a CORS error. Helm:
+  `rest.corsAllowedOrigins`.
+- **Metrics.** `/metrics` carries `qod_rest_requests_total{route,format,status}`,
+  `qod_rest_request_seconds`, `qod_rest_rejections_total{reason}` (`auth_failures`,
+  `concurrency`) and `qod_rest_stream_aborts_total` (streamed bodies cut, abandoned by their
+  client, or never started).
+- **Failed-auth throttle.** A client address that fails authentication (401, or 403
+  `forbidden` for a wrong tenant or a token without `rest`) more than
+  `QOD_REST_AUTH_FAILURES_PER_WINDOW` (20) times within `QOD_REST_AUTH_WINDOW_SEC` (60 s) is
+  blocked for `QOD_REST_AUTH_BLOCK_SEC` (300 s): every request from it, even with a valid
+  token, gets 429 `too_many_auth_failures` with `Retry-After`, before any token lookup. A
+  success does not reset the count. Each block is audited as `auth.rest.throttled` (the manager log has a WARN per
+  block). `acl_denied`, 404 and 400 answers never count.
+- **Behind a load balancer or reverse proxy, set `QOD_REST_TRUSTED_PROXIES`.** The client
+  address is the TCP peer, so without it every client shares the proxy's budget and one
+  guessing client blocks them all. List the proxies' addresses as CIDRs
+  (`QOD_REST_TRUSTED_PROXIES=10.0.0.0/8,fd00::/8`); `X-Forwarded-For` is then read from the
+  right, skipping trusted hops (a `:port` on a hop is ignored, and an `unknown` hop is never
+  taken as the client), and is ignored from any other peer, so a client cannot pick its own
+  address. IPv6 clients are grouped per /64. Helm: `rest.trustedProxies` (and
+  `rest.authThrottle.*`, `rest.maxConcurrentPerUser`, `rest.maxConcurrentTotal`,
+  `rest.maxConcurrentParquet` and `rest.maxStreamSec` for the throttle and the caps).
+- **Concurrency cap.** Each user runs at most `QOD_REST_MAX_CONCURRENT_PER_USER` (4)
+  requests at once, whatever the number of their tokens, and the edge at most
+  `QOD_REST_MAX_CONCURRENT_TOTAL` (16); past either the answer is 429 `too_many_requests`
+  with `Retry-After: 1`. A request that timed out (504), or a streamed body still being
+  read, keeps its slot until the node finishes the statement. Each request may buffer a JSON
+  or CSV page of up to `QOD_REST_MAX_RESPONSE_BYTES` in the manager heap, in a buffer that
+  grows by doubling (up to three times that while it grows): size the heap for up to
+  3 x `QOD_REST_MAX_CONCURRENT_TOTAL` x `QOD_REST_MAX_RESPONSE_BYTES` (3 x 16 x 64 MiB =
+  3 GiB by default), or lower one of them.
+- **These limits are per manager replica** (with N replicas the effective budget is N
+  times the setting). For internet exposure, a WAF or rate-limiting proxy in front of the
+  port is still recommended for volumetric and DDoS limits.
 - Errors are `{"error": "<code>", "message": "..."}`: 401 `unauthorized` (one body for every
   credential failure), 403 `forbidden` / `acl_denied`, 404 `not_found`, 400
   `invalid_filter` / `unknown_column` / `order_required` / `invalid_parameter`, 406
-  `unsupported_format`, 502 `upstream_error`, 503 `pool_resuming` / `pool_unavailable`,
-  504 `statement_timeout`. The message of a 502 carries a request id: the manager log has a
-  WARN line under that id with the failure class, and the node's own text at DEBUG only.
+  `unsupported_format`, 429 `too_many_auth_failures` / `too_many_requests`, 502
+  `upstream_error`, 503 `pool_resuming` / `pool_unavailable`, 504 `statement_timeout`. The
+  message of a 502 carries a request id: the manager log has a WARN line under that id with
+  the failure class, and the node's own text at DEBUG only.
 
 ## Hardening (lockdown, pod security, network policy, reader eviction)
 
@@ -2108,6 +2177,11 @@ opt-in except pod security:
 | `/api/*` returns 401 | No valid credential on the call (missing/wrong key, expired session) | `qod login`, or pass `X-API-Key: <key>` on raw REST calls |
 | REST data edge (`:31339`) returns 401 on every call | Not a live PAT of a tenant user: static key, session, superuser-owned or revoked token | Mint a PAT as the tenant user (`qod auth pat create --tool rest ...`) and send `Authorization: Bearer qod_pat_...` |
 | REST data edge returns 403 `forbidden` | Path tenant is not the token's tenant, or the token's `tools` axis lacks `rest` | Fix the URL's tenant, or mint a token with `--tool rest` (or no `--tool` at all) |
+| REST data edge returns 401 to an OIDC token | The tenant has no OIDC provider of its own, the token lacks `exp` or is for another issuer/audience, or its user is not provisioned (or disabled) in the tenant | Configure the tenant's provider (`qod tenant set-auth`), create the user in the tenant, or use a PAT |
+| REST data edge returns 429 `too_many_auth_failures`, even with a valid token | The client address failed authentication more than `QOD_REST_AUTH_FAILURES_PER_WINDOW` times in the window and is blocked for `QOD_REST_AUTH_BLOCK_SEC` | Wait out `Retry-After` and fix the failing client. If EVERY client is blocked at once, the edge sits behind a proxy it does not trust: set `QOD_REST_TRUSTED_PROXIES` to the proxy's CIDRs |
+| REST data edge returns 429 `too_many_requests` | The user already has `QOD_REST_MAX_CONCURRENT_PER_USER` requests in flight (all their tokens count together), the edge `QOD_REST_MAX_CONCURRENT_TOTAL`, or (Parquet only) the user already streams a Parquet body or the edge `QOD_REST_MAX_CONCURRENT_PARQUET` of them | Retry after `Retry-After: 1`, run fewer requests in parallel, or raise the cap |
+| A streamed Arrow / Parquet download from the REST data edge breaks off mid-way | The page reached `QOD_REST_MAX_RESPONSE_BYTES` with rows left, or ran past `QOD_REST_MAX_STREAM_SEC`; the edge aborts rather than end a partial page cleanly | Lower `limit` (page with `X-QoD-Limit` and `offset`), or read faster |
+| Browser app gets a CORS error from the REST data edge | Its origin is not in `QOD_REST_CORS_ALLOWED_ORIGINS` (exact scheme, host and port), or it sends credentials | Add the origin and restart; send the token in `Authorization`, with `credentials: 'omit'` |
 | `no node with role READONLY or DUAL` | All nodes flipped unhealthy (port unreachable) | Check `pgrep -fl spawn-quack-node`; if 0, run `qod stop` + `qod start` (reconcile respawns) |
 | `access denied: missing RO grant on ...` | ACL is enabled and the user has no matching grant | Add the grant via `qod role permission grant` or set `QOD_ACL_ENABLED=false` |
 | `session expired; please reconnect` | Bearer token unknown (manager restarted between calls) | Re-login or pass Basic credentials |
