@@ -47,7 +47,15 @@ class AuditRecorderSpec extends AnyFlatSpec with Matchers:
     (e.actor, e.actorRealm, e.origin, e.outcome) shouldBe ("alice", "tenant", "rest", "ok")
   }
 
-  it should "record static-key callers as static-key/system and no token as anonymous" in {
+  "restAs" should "record the origin its caller names, rest by default" in {
+    val store = new RecordingStore
+    val r     = recorder(store, _ => None)
+    r.restAs("anonymous", "system", "auth", "auth.x", "denied")
+    r.restAs("anonymous", "system", "auth", "auth.x", "denied", origin = "rest-data")
+    store.events.map(_.origin).toList shouldBe List("rest", "rest-data")
+  }
+
+  "rest" should "record static-key callers as static-key/system and no token as anonymous" in {
     val store = new RecordingStore
     val r     = recorder(store, _ => None)
     r.rest(Some("static-abc"), "control-plane", "pool.delete", "ok")
