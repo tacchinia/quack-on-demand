@@ -48,6 +48,45 @@ object Banner:
              |$Line""".stripMargin
         )
 
+  private def display(h: String) = if h == "0.0.0.0" || h == "::" then "localhost" else h
+
+  /** Whether OPA enforces any tenant's statements: the default mode is not `qod`, or at least one
+    * tenant is in `opa` mode. While it does, no ACL line may imply that nothing is enforced.
+    */
+  def opaInPlay(aclMode: String, opaTenants: Int): Boolean = aclMode != "qod" || opaTenants > 0
+
+  /** The REST data edge's banner line, without the banner's indent. With the SQL ACL disabled the
+    * same line carries the warning instead of the auth note: the edge still boots (a warning, not a
+    * refusal), but every PAT of a `qod` tenant can then read every table of that tenant. While OPA
+    * enforces some tenants the warning says so, in the words of the SQL ACL line, rather than claim
+    * that nothing is enforced.
+    */
+  def restLine(
+      host: String,
+      port: Int,
+      tls: Boolean,
+      aclEnabled: Boolean,
+      opaInPlay: Boolean = false
+  ): String =
+    val url  = s"${if tls then "https" else "http"}://${display(host)}:$port/api/v1"
+    val note =
+      if aclEnabled then "PAT bearer, read-only"
+      else if opaInPlay then
+        "ACL DISABLED for qod tenants: any PAT of such a tenant can read every table; " +
+          "opa tenants enforced by OPA"
+      else "ACL DISABLED: any PAT of the tenant can read every table"
+    s"REST (data)   : $url  ($note)"
+
+  /** The boot WARN Main logs next to BootFactories' "SQL ACL disabled" warning: the REST line when
+    * the edge is on and the SQL ACL is off, nothing otherwise.
+    */
+  def restAclWarning(
+      rest: Option[(String, Int, Boolean)],
+      aclEnabled: Boolean,
+      opaInPlay: Boolean = false
+  ): Option[String] =
+    rest.filterNot(_ => aclEnabled).map((h, p, tls) => restLine(h, p, tls, aclEnabled, opaInPlay))
+
   /** The post-startup banner: printed once REST and FlightSQL are both listening. `restHost` /
     * `flightHost` of 0.0.0.0 render as localhost so the endpoints are copy-pasteable. Client
     * connection strings are not printed; the banner links to their documentation instead.
@@ -61,6 +100,8 @@ object Banner:
       tlsEnabled: Boolean,
       /** The native Quack front door `(host, port, tls)` when it is enabled. */
       quack: Option[(String, Int, Boolean)] = None,
+      /** The REST data edge `(host, port, tls)` when it is enabled. */
+      rest: Option[(String, Int, Boolean)] = None,
       /** Whether the SQL ACL (`quack-flightsql.acl.enabled`, env `QOD_ACL_ENABLED`) is enforced.
         * Required, not defaulted: the logger's ACL line sits below the default ERROR level, so this
         * banner is the one place an operator reliably sees whether grants are enforced.
@@ -79,18 +120,20 @@ object Banner:
         */
       cliConfigFile: Option[String] = None
   ): String =
-    def display(h: String) = if h == "0.0.0.0" || h == "::" then "localhost" else h
-    val opaInPlay          = aclMode != "qod" || opaTenants > 0
-    val aclLine            =
+    val opa     = opaInPlay(aclMode, opaTenants)
+    val aclLine =
       if aclEnabled then "   SQL ACL       : ENABLED (grants, column and row policies enforced)"
-      else if opaInPlay then
+      else if opa then
         "   SQL ACL       : DISABLED for qod tenants (every statement admitted; set QOD_ACL_ENABLED=true to enforce); opa tenants enforced by OPA"
       else
         "   SQL ACL       : DISABLED (every statement admitted; set QOD_ACL_ENABLED=true to enforce)"
     val modeLine =
       s"   ACL MODE      : $aclMode (default for tenants that set none; $opaTenants tenant(s) in opa mode)"
-    val rh        = display(restHost)
-    val fh        = display(flightHost)
+    val rh             = display(restHost)
+    val fh             = display(flightHost)
+    val restBannerLine = rest.fold("") { case (h, p, tls) =>
+      s"\n   ${restLine(h, p, tls, aclEnabled, opa)}"
+    }
     val quackLine = quack.fold("") { case (h, p, tls) =>
       s"\n   Quack (DuckDB): quack:${display(h)}:$p  (${if tls then "TLS" else "plain HTTP"})"
     }
@@ -102,7 +145,7 @@ object Banner:
        | Quack on Demand $version is up$configLine
        |   control plane : ${jdbcControlPlaneUrl(meta)}
        |   REST API + UI : http://$rh:$restPort  (UI: http://$rh:$restPort/ui)
-       |   FlightSQL     : $scheme://$fh:$flightPort$quackLine
+       |   FlightSQL     : $scheme://$fh:$flightPort$quackLine$restBannerLine
        |$aclLine
        |$modeLine
        |
