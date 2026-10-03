@@ -26,17 +26,23 @@ object BoundedWait:
     * `Right` that arrives afterwards is handed to `close`. The same applies when the waiting caller
     * is itself cancelled (an outer timeout, a disconnect). A late `Left` or a late error is
     * dropped: it holds nothing to release.
+    *
+    * `beforeStart` runs uncancelably right before `run`'s fiber starts: whatever it acquires is
+    * then owned by that fiber's outcome, with no window in which a cancelled caller could leave it
+    * held (the REST edge retains its per-user slot here and releases it when the node call ends).
     */
   def closingLate[E, A](
       run: IO[Either[E, A]],
       limit: FiniteDuration,
       onTimeout: => E,
-      close: A => Unit
+      close: A => Unit,
+      beforeStart: IO[Unit] = IO.unit
   ): IO[Either[E, A]] =
     IO.uncancelable { poll =>
       for
         state   <- Ref[IO].of[Handoff](Handoff.Waiting)
         outcome <- Deferred[IO, Either[Throwable, Either[E, A]]]
+        _       <- beforeStart
         _       <- run.attempt.flatMap { r =>
           state.modify {
             case Handoff.Waiting => (Handoff.Delivered, outcome.complete(r).void)
