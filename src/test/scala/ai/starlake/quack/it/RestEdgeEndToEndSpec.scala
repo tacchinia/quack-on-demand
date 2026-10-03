@@ -5,7 +5,8 @@ import ai.starlake.quack.boot.{EmbeddedControlPlane, RoutedExecutor}
 import ai.starlake.quack.edge.{FlightSqlRouter, SessionRegistry}
 import ai.starlake.quack.edge.adapter.{NodeLoadTracker, QuackHttpAdapter, QuackHttpClient}
 import ai.starlake.quack.edge.meta.MetadataFilterRewriter
-import ai.starlake.quack.edge.rest.{RestEdgeHandlers, RestEdgeServer}
+import ai.starlake.quack.edge.auth.OidcBearerAuthenticator
+import ai.starlake.quack.edge.rest.{RestEdgeHandlers, RestEdgeServer, RestOidc}
 import ai.starlake.quack.edge.sql.PostgresAclValidator
 import ai.starlake.quack.model.{
   NodeSpec,
@@ -29,6 +30,7 @@ import ai.starlake.quack.ondemand.state.{
 import ai.starlake.quack.ondemand.telemetry.{EventJournal, StatementQuery}
 import ai.starlake.quack.ondemand.telemetry.testkit.RecordingTelemetryStore
 import ai.starlake.quack.route.StatementClassifier
+import ai.starlake.quack.security.{JwtTestSigner, MockOidcServer}
 import cats.effect.IO
 import cats.effect.unsafe.implicits.global
 import io.circe.Json
@@ -53,7 +55,8 @@ import scala.util.{Failure, Success, Try}
   * metadata filter mounted, the audit journal, statement history) and on to live Quack nodes
   * spawned through [[LocalQuackBackend]], the backend `PoolSupervisor.createPool` uses in
   * production. Credentials are real PATs minted into a real `qodstate_pat` table and resolved by
-  * [[PatAuthenticator]].
+  * [[PatAuthenticator]], and bearer JWTs of acme's own OIDC provider (a WireMock IdP with a local
+  * JWKS) verified by a real [[OidcBearerAuthenticator]] through [[RestOidc]].
   *
   * The executor is the production [[RoutedExecutor]] (the pools axis, `branchOnly`, the handshake,
   * attenuation, then [[RoutedExecutor.viaRouter]]), built over this spec's router exactly as `Main`
@@ -323,6 +326,21 @@ class RestEdgeEndToEndSpec extends AnyFlatSpec with Matchers with BeforeAndAfter
                 Map("dataPath" -> lakeData.toString)
             )
           )
+        // acme's own OIDC provider; globex has none, so its paths verify no JWT.
+        val idp = MockOidcServer.boot()
+        onTeardown("OIDC provider")(idp.shutdown())
+        val acmeProvider = new OidcBearerAuthenticator(
+          "keycloak",
+          s"${idp.baseUrl}/jwks",
+          idp.issuer,
+          OidcAudience,
+          "role"
+        )
+        val oidc = new RestOidc(
+          tenantId = t => sup.getTenant(t).map(_.id),
+          providerFor = t => Option.when(t == Acme)(acmeProvider),
+          findUser = (t, u) => sup.findUserForLogin(t, u)
+        )
         def edgeOver(r: FlightSqlRouter): (RestEdgeServer, String) =
           val cfg      = edgeConfig(freePort())
           val handlers = new RestEdgeHandlers(
@@ -336,7 +354,8 @@ class RestEdgeEndToEndSpec extends AnyFlatSpec with Matchers with BeforeAndAfter
               recordExecution = false
             ),
             catalogReader,
-            (t, db, tag) => store.findSnapshotTag(t, db, tag).map(_.snapshotId)
+            (t, db, tag) => store.findSnapshotTag(t, db, tag).map(_.snapshotId),
+            resolveOidc = oidc.resolve
           )
           val server = new RestEdgeServer(cfg, RestEdgeServer.serverEndpoints(handlers))
           server.start().unsafeRunSync()
@@ -356,7 +375,12 @@ class RestEdgeEndToEndSpec extends AnyFlatSpec with Matchers with BeforeAndAfter
           tokens = tokens,
           coldKey = coldKey,
           attachLake = attachLake,
-          catalogReader = catalogReader
+          catalogReader = catalogReader,
+          jwtFor = user =>
+            Pat(
+              s"oidc-$user",
+              JwtTestSigner.mint(Map("sub" -> user), idp.issuer, Some(OidcAudience))
+            )
         )
       }
 
@@ -686,6 +710,25 @@ class RestEdgeEndToEndSpec extends AnyFlatSpec with Matchers with BeforeAndAfter
     mcpOnly.error._1 shouldBe "forbidden"
   }
 
+  "an OIDC bearer of the tenant's own provider" should "read as its user, through its grants" in {
+    val e   = env
+    val jwt = Some(e.jwtFor("alice"))
+    ints(
+      okResp(get(e.base, rowsOf("orders"), jwt, "select=o_id&order=o_id&limit=3")),
+      "o_id"
+    ) shouldBe
+      List(10, 20, 30)
+    // The same grants as alice's PAT: the ungranted table is the missing one's 404.
+    val denied  = get(e.base, rowsOf("secret"), jwt)
+    val missing = get(e.base, rowsOf("no_such_table"), jwt)
+    denied.status shouldBe 404
+    (denied.status, denied.body) shouldBe (missing.status, missing.body)
+    // Verified by acme's provider only: globex has none, and a user acme never provisioned
+    // (bob is globex's) is refused like a bad token.
+    get(e.base, s"$Globex/database/$LakeDb/schemas", jwt).status shouldBe 401
+    get(e.base, lake("schemas"), Some(e.jwtFor("bob"))).status shouldBe 401
+  }
+
   // ---- cap precedence ---------------------------------------------------------------------
 
   "the row cap" should "be min(limit or defaultLimit, maxRows, the token's maxRows)" in {
@@ -843,6 +886,9 @@ object RestEdgeEndToEndSpec:
   val FileKey    = "e2e0123456789abcdef0123456789abc"
   val ControlDb  = "qod_rest_e2e"
 
+  /** The audience acme's OIDC provider expects: its client id. */
+  val OidcAudience = "qod-rest-e2e"
+
   val DefaultLimit = 3
   val MaxRows      = 6
 
@@ -872,7 +918,9 @@ object RestEdgeEndToEndSpec:
       tokens: Tokens,
       coldKey: PoolKey,
       attachLake: String,
-      catalogReader: (String, String) => DuckLakeCatalogReader
+      catalogReader: (String, String) => DuckLakeCatalogReader,
+      /** A bearer JWT of acme's own OIDC provider naming `user`. */
+      jwtFor: String => Pat
   )
 
   /** The real local backend, with one seam for the cold-start case: a pool on the refused list

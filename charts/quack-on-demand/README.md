@@ -71,7 +71,7 @@ OCI publication to a public registry is a planned follow-up.
 | `Deployment` | The manager pod. Default `replicas: 1` (see the Resilience guide at https://starlake-ai.github.io/quack-on-demand/operating/resilience and #11). |
 | `Service` (REST) | ClusterIP on `:20900` for `/api`, `/ui`, `/metrics`. |
 | `Service` (FlightSQL) | ClusterIP on `:31338` for the Arrow Flight gRPC edge. |
-| `Service` (REST data) | `<release>-rest`, ClusterIP on `:31339` for the read-only REST data edge (`GET /api/v1/...`, PAT bearer). Only when `rest.enabled`. |
+| `Service` (REST data) | `<release>-rest`, ClusterIP on `:31339` for the read-only REST data edge (`GET /api/v1/...`, PAT or tenant-OIDC bearer). Only when `rest.enabled`. |
 | `ServiceAccount` | Bound to the `Role` below. |
 | `Role` + `RoleBinding` | Pods + services CRUD in the manager's own namespace. **Not a `ClusterRole`** - the manager only ever talks to its own namespace. |
 | `ConfigMap` | `QOD_*` / `PROXY_*` env-var overrides - everything in `application.conf` that isn't a secret. |
@@ -95,7 +95,7 @@ See [`values.yaml`](values.yaml) for the full list. The most-used:
 | `apiKey.value` | `""` | Static `X-API-Key` for `/api/*`. Optional - UI login still works without it. |
 | `flightsql.tls.enabled` | `true` | Manager auto-generates a self-signed cert at boot when no Secret is mounted. |
 | `service.flightsql.type` | `ClusterIP` | Override to `LoadBalancer` / `NodePort` to expose externally. |
-| `rest.enabled` | `false` | Read-only REST data edge on `:31339` (`QOD_REST_ENABLED`), with its Service and NetworkPolicy port. PATs only. It throttles failed authentication per client and caps in-flight requests per user; a WAF is still recommended for volumetric and DDoS limits on internet exposure. |
+| `rest.enabled` | `false` | Read-only REST data edge on `:31339` (`QOD_REST_ENABLED`), with its Service and NetworkPolicy port. PAT or tenant-OIDC bearer. It throttles failed authentication per client and caps in-flight requests per user; a WAF is still recommended for volumetric and DDoS limits on internet exposure. |
 | `rest.tls.enabled` | `true` | `QOD_REST_TLS_ENABLED`; reuses the Flight edge's PEM pair. |
 | `rest.trustedProxies` | `""` | `QOD_REST_TRUSTED_PROXIES`: CIDRs of the proxies / load balancers whose `X-Forwarded-For` identifies the client. Set it behind an Ingress or LB: otherwise every client shares one failed-auth budget, and one client's bad tokens block everyone. |
 | `rest.authThrottle.*` | `20` / `60` / `300` / `100000` | `failuresPerWindow` / `windowSec` / `blockSec` / `maxEntries` of the failed-authentication throttle (`QOD_REST_AUTH_*`), per replica. |

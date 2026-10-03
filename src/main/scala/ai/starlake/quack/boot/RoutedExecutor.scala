@@ -158,6 +158,12 @@ object RoutedExecutor:
                 poolKey.tenant,
                 poolKey.pool,
                 caller.identity,
+                // A verified bearer JWT's roles, groups and claims, as the FlightSQL handshake
+                // passes its own; empty for every caller without one.
+                jwtRoles = caller.jwtRoles,
+                jwtGroups = caller.jwtGroups,
+                jwtClaims = caller.jwtClaims,
+                superuserAdmissible = caller.superuserAdmissible,
                 edge = caller.edge,
                 // Attenuate before gate 4: an opa tenant's connect sees only the token's roles.
                 restriction = caller.restriction

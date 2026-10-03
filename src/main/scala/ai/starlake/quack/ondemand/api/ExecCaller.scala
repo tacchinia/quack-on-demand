@@ -27,6 +27,13 @@ import ai.starlake.quack.ondemand.auth.TokenRestriction
   * the REST edge sends its data statement to the node that answered its schema probe, and a
   * vanished node falls back to the usual pick. All three default to what every call site had before
   * they existed.
+  *
+  * `jwtRoles`, `jwtGroups` and `jwtClaims` are what a VERIFIED bearer JWT said about the caller,
+  * handed to the handshake exactly as the FlightSQL edge hands its own: the roles and groups widen
+  * the user's EffectiveSet by name inside the user's tenant, and the claims ride on it to the OPA
+  * input. `superuserAdmissible = false` says the credential was validated by a tenant-scoped
+  * authority, which cannot speak for a tenant-less superuser row of the same name; the handshake
+  * then refuses that row. Empty and `true` are what every caller without a JWT had before.
   */
 final case class ExecCaller(
     connectionId: String,
@@ -36,7 +43,11 @@ final case class ExecCaller(
     system: Boolean = false,
     source: String = "flightsql",
     edge: String = "mcp",
-    preferredNode: Option[String] = None
+    preferredNode: Option[String] = None,
+    jwtRoles: Set[String] = Set.empty,
+    jwtGroups: Set[String] = Set.empty,
+    jwtClaims: Map[String, String] = Map.empty,
+    superuserAdmissible: Boolean = true
 ):
   /** The row cap actually applied: the server cap, the token's cap and the request's, smallest
     * wins. A token can lower the cap and can never raise it.
