@@ -1863,7 +1863,8 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
   private def setupWithSupervisor(
       failResumeStarts: Boolean = false,
       resumeHoldTimeout: FiniteDuration = 60.seconds,
-      resumePollInterval: FiniteDuration = 250.millis
+      resumePollInterval: FiniteDuration = 250.millis,
+      nodeAccepting: RunningNode => IO[Boolean] = _ => IO.pure(true)
   ) =
     val failStart = new java.util.concurrent.atomic.AtomicBoolean(false)
     val backend   = new QuackBackend:
@@ -1915,7 +1916,8 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       adapter,
       stmtInstruments = si,
       resumeHoldTimeout = resumeHoldTimeout,
-      resumePollInterval = resumePollInterval
+      resumePollInterval = resumePollInterval,
+      nodeAccepting = nodeAccepting
     )
     (router, sup)
 
@@ -1943,6 +1945,42 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     r match
       case Left(RouterFailure.Unavailable(msg)) => msg should include("resuming")
       case other => fail(s"expected Unavailable('pool is resuming...'), got $other")
+
+  it should "hold until the woken node accepts connections" in:
+    // A local node is routable once launched, before `quack_serve` listens.
+    val asked         = new java.util.concurrent.atomic.AtomicInteger(0)
+    val (router, sup) = setupWithSupervisor(
+      resumePollInterval = 20.millis,
+      nodeAccepting = _ => IO(asked.incrementAndGet() >= 3)
+    )
+    sup.suspendPool(poolKey, "rest").unsafeRunSync()
+    val r = router
+      .execute("wake-5", "alice", poolKey, "SELECT 1", recordExecution = true)
+      .unsafeRunSync()
+    r.isRight shouldBe true
+    asked.get() shouldBe 3
+
+  it should "time out with a retryable error when the woken node never accepts" in:
+    val (router, sup) = setupWithSupervisor(
+      resumeHoldTimeout = 300.millis,
+      resumePollInterval = 50.millis,
+      nodeAccepting = _ => IO.pure(false)
+    )
+    sup.suspendPool(poolKey, "rest").unsafeRunSync()
+    router
+      .execute("wake-6", "alice", poolKey, "SELECT 1", recordExecution = true)
+      .unsafeRunSync() match
+      case Left(RouterFailure.Unavailable(msg)) => msg should include("resuming")
+      case other => fail(s"expected Unavailable('pool is resuming...'), got $other")
+
+  "tcpAccepting" should "tell a listening port from a closed one" in:
+    val server = new java.net.ServerSocket(0)
+    val node   = RunningNode(
+      "n", poolKey, Role.Dual, "127.0.0.1", server.getLocalPort, "tok", None, None, Instant.EPOCH
+    )
+    try FlightSqlRouter.tcpAccepting()(node).unsafeRunSync() shouldBe true
+    finally server.close()
+    FlightSqlRouter.tcpAccepting()(node).unsafeRunSync() shouldBe false
 
   it should "not wake a disabled pool" in:
     val (router, sup) = setupWithSupervisor()

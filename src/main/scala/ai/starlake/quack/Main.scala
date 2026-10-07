@@ -1247,7 +1247,8 @@ object Main extends IOApp with LazyLogging:
         // see BootFactories.metadataFilterMounted.
         metadataFilterRewriter = BootFactories.metadataFilterRewriter(aclCfg),
         protectedWriteGuard = protectedWriteGuard,
-        adminExecutor = adminExecutor
+        adminExecutor = adminExecutor,
+        nodeAccepting = FlightSqlRouter.tcpAccepting()
       )
 
       // The try/catch downgrades JVM Errors (e.g. Arrow/Netty LinkageError) into a

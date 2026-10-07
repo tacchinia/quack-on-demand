@@ -109,7 +109,15 @@ final class FlightSqlRouter(
       * `metadataFilterRewriter` / `protectedWriteGuard`: `Main` passes the leading arguments
       * positionally.
       */
-    val adminExecutor: Option[ai.starlake.quack.edge.admin.AdminStatementExecutor] = None
+    val adminExecutor: Option[ai.starlake.quack.edge.admin.AdminStatementExecutor] = None,
+    /** Whether a node accepts connections, asked only while a resume hold waits for a woken pool: a
+      * local node counts as routable as soon as its process is launched, before `quack_serve`
+      * listens, so a hold that ended on `routable` alone sent the statement to a closed port.
+      * Always true by default (specs with fake nodes); `Main` wires
+      * [[FlightSqlRouter.tcpAccepting]]. TAIL param for the same reason as
+      * `metadataFilterRewriter`.
+      */
+    val nodeAccepting: ai.starlake.quack.model.RunningNode => IO[Boolean] = _ => IO.pure(true)
 ):
 
   /** Record a statement outcome into history, metrics, and (selectively) the audit journal:
@@ -932,9 +940,10 @@ final class FlightSqlRouter(
       case _ => sql
 
   /** Resolve the routing snapshot, waking a suspended (never a disabled) pool first: fire
-    * resumePool then poll for a routable node, bounded by resumeHoldTimeout; expiry yields the
-    * retryable "pool is resuming" UNAVAILABLE. resumePool errors are swallowed (.attempt):
-    * reconcile retries the spawn and the poll either sees a node or times out.
+    * resumePool then poll for a routable node that accepts connections ([[nodeAccepting]]), bounded
+    * by resumeHoldTimeout; expiry yields the retryable "pool is resuming" UNAVAILABLE. resumePool
+    * errors are swallowed (.attempt): reconcile retries the spawn and the poll either sees a node
+    * or times out.
     */
   private def resolveSnapshot(poolKey: PoolKey): IO[Either[RouterFailure, PoolSnapshot]] =
     supervisor.get(poolKey) match
@@ -946,13 +955,21 @@ final class FlightSqlRouter(
         def poll(remaining: FiniteDuration): IO[Either[RouterFailure, PoolSnapshot]] =
           IO.defer {
             supervisor.snapshot(poolKey) match
-              case Some(snap) if snap.nodes.exists(n => snap.loadOf(n.nodeId).routable) =>
-                IO.pure(Right(snap))
-              case _ if remaining <= Duration.Zero =>
-                IO.pure(Left(RouterFailure.Unavailable("pool is resuming, retry shortly")))
-              case _ =>
-                IO.sleep(resumePollInterval) *> poll(remaining - resumePollInterval)
+              case Some(snap) =>
+                val routable = snap.nodes.filter(n => snap.loadOf(n.nodeId).routable)
+                routable
+                  .foldLeft(IO.pure(false)) { (found, n) =>
+                    found.flatMap(if _ then IO.pure(true) else nodeAccepting(n))
+                  }
+                  .flatMap(accepting =>
+                    if accepting then IO.pure(Right(snap)) else retry(remaining)
+                  )
+              case None => retry(remaining)
           }
+        def retry(remaining: FiniteDuration): IO[Either[RouterFailure, PoolSnapshot]] =
+          if remaining <= Duration.Zero then
+            IO.pure(Left(RouterFailure.Unavailable("pool is resuming, retry shortly")))
+          else IO.sleep(resumePollInterval) *> poll(remaining - resumePollInterval)
         supervisor.resumePool(poolKey, "query").attempt *> poll(resumeHoldTimeout)
       case Some(_) =>
         supervisor.snapshot(poolKey) match
@@ -1030,6 +1047,22 @@ object FlightSqlRouter:
     * set them.
     */
   val ReservedAuditKeys: Set[String] = Set("sql", "denied", "reason", "durationMs")
+
+  /** [[FlightSqlRouter.nodeAccepting]] in production: a TCP connect to the node's port, bounded by
+    * `timeout`. The spawn script runs `quack_serve` last, after every ATTACH, so a node that
+    * accepts a connection is one that can serve its catalog.
+    */
+  def tcpAccepting(timeout: FiniteDuration = 250.millis)(
+      n: ai.starlake.quack.model.RunningNode
+  ): IO[Boolean] =
+    IO.blocking {
+      val s = new java.net.Socket()
+      try
+        s.connect(new java.net.InetSocketAddress(n.host, n.port), timeout.toMillis.toInt)
+        true
+      catch case _: java.io.IOException => false
+      finally s.close()
+    }
 
   /** One node call for [[FlightSqlRouter.executeWith]]: `(node, wrappedSql, stampPrelude,
     * recordLoad) => outcome`. Implementations must book load through
