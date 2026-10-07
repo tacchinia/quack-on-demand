@@ -17,6 +17,17 @@ object TestArrow:
 
   Class.forName("org.duckdb.DuckDBDriver")
 
+  // ONE in-memory database for every reader. A database owns a pool of worker threads; opening
+  // one per reader (readers here are rarely closed, `okResponse` closes nothing) leaked them until
+  // the test JVM hit the OS per-process thread limit and the suite stalled. A duplicate
+  // connection costs no thread.
+  private lazy val shared: DuckDBConnection =
+    val c = DriverManager.getConnection("jdbc:duckdb:").asInstanceOf[DuckDBConnection]
+    val s = c.createStatement()
+    try s.execute("SET threads = 1")
+    finally s.close()
+    c
+
   /** Reader yielding a single row `SELECT 1 AS x`. */
   def oneRowReader(): ArrowReader =
     readerFor("SELECT 1 AS x")
@@ -28,7 +39,7 @@ object TestArrow:
 
   /** Reader for arbitrary SQL evaluated against the in-process DuckDB. */
   def readerFor(sql: String): ArrowReader =
-    val conn = DriverManager.getConnection("jdbc:duckdb:").asInstanceOf[DuckDBConnection]
+    val conn = shared.duplicate().asInstanceOf[DuckDBConnection]
     val stmt = conn.createStatement()
     val rs   = stmt.executeQuery(sql).asInstanceOf[DuckDBResultSet]
     rs.arrowExportStream(sharedAllocator, 1024L).asInstanceOf[ArrowReader]
