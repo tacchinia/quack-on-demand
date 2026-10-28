@@ -2791,7 +2791,10 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       failResumeStarts: Boolean = false,
       resumeHoldTimeout: FiniteDuration = 60.seconds,
       resumePollInterval: FiniteDuration = 250.millis,
-      nodeAccepting: RunningNode => IO[Boolean] = _ => IO.pure(true)
+      nodeAccepting: RunningNode => IO[Boolean] = _ => IO.pure(true),
+      distribution: RoleDistribution = RoleDistribution(0, 0, 1),
+      /** The endpoints the statements were sent to. */
+      sent: scala.collection.mutable.ListBuffer[String] = scala.collection.mutable.ListBuffer.empty
   ) =
     val failStart = new java.util.concurrent.atomic.AtomicBoolean(false)
     val backend   = new QuackBackend:
@@ -2825,12 +2828,12 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     sup
       .createTenantDb(poolKey.tenant, poolKey.tenantDb, TenantDbKind.InMemory, Map.empty, "")
       .unsafeRunSync()
-    sup.createPool(poolKey, RoleDistribution(0, 0, 1)).unsafeRunSync()
+    sup.createPool(poolKey, distribution).unsafeRunSync()
     if failResumeStarts then failStart.set(true)
 
     val client = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
-        IO.pure(TestArrow.okResponse())
+        IO(sent.synchronized(sent += endpoint)) *> IO.pure(TestArrow.okResponse())
     val adapter = new QuackHttpAdapter(client, tracker)
     val router  = new FlightSqlRouter(
       sup,
@@ -2895,6 +2898,39 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       .unsafeRunSync() match
       case Left(RouterFailure.Unavailable(msg)) => msg should include("resuming")
       case other => fail(s"expected Unavailable('pool is resuming...'), got $other")
+
+  it should "send the statement to a woken node that accepts, not to one still starting" in:
+    val sent          = scala.collection.mutable.ListBuffer.empty[String]
+    val (router, sup) = setupWithSupervisor(
+      resumePollInterval = 20.millis,
+      nodeAccepting = n => IO.pure(n.port == 28001),
+      distribution = RoleDistribution(0, 0, 2),
+      sent = sent
+    )
+    sup.suspendPool(poolKey, "rest").unsafeRunSync()
+    router
+      .execute("wake-7", "alice", poolKey, "SELECT 1", recordExecution = true)
+      .unsafeRunSync()
+      .isRight shouldBe true
+    sent.toList match
+      case List(endpoint) => endpoint should include(":28001")
+      case other          => fail(s"expected one statement, sent to $other")
+
+  it should "count the time its connection probes take against the hold" in:
+    val (router, sup) = setupWithSupervisor(
+      resumeHoldTimeout = 300.millis,
+      resumePollInterval = 50.millis,
+      nodeAccepting = _ => IO.sleep(200.millis).as(false),
+      distribution = RoleDistribution(0, 0, 2)
+    )
+    sup.suspendPool(poolKey, "rest").unsafeRunSync()
+    val start = System.nanoTime()
+    router
+      .execute("wake-8", "alice", poolKey, "SELECT 1", recordExecution = true)
+      .unsafeRunSync() shouldBe a[Left[?, ?]]
+    // Two nodes probed at once, each probe 200 ms: about 300 ms plus one probe, never one per
+    // node per poll on top of the interval.
+    (System.nanoTime() - start).nanos should be < 1.second
 
   "tcpAccepting" should "tell a listening port from a closed one" in:
     val server = new java.net.ServerSocket(0)
