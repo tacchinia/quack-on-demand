@@ -18,16 +18,23 @@ import ai.starlake.quack.edge.sql.{
   ValidationContext,
   ValidatorUnavailable
 }
-import ai.starlake.quack.model.{PoolKey, SqlLiterals, StatementKind, TenantDb}
+import ai.starlake.quack.model.{PoolKey, SessionCatalog, SqlLiterals, StatementKind, TenantDb}
 import ai.starlake.quack.ondemand.PoolSupervisor
 import ai.starlake.quack.ondemand.rbac.EffectiveSet
 import ai.starlake.quack.ondemand.telemetry.{AuditActions, AuditEvent, EventJournal, StatementEvent}
-import ai.starlake.quack.route.{PoolSnapshot, Router, RoutingDecision, StatementClassifier}
+import ai.starlake.quack.route.{
+  PoolSnapshot,
+  RoleMatcher,
+  Router,
+  RoutingDecision,
+  StatementClassifier
+}
 import ai.starlake.quack.spi.{ManagerEvent, ManagerEventSink}
 import ai.starlake.sql.{SqlCommentStripper, SqlTrivia, TooDeep}
 
 import ai.starlake.quack.observability.metrics.StatementInstruments
 import cats.effect.IO
+import cats.syntax.parallel.*
 
 import scala.concurrent.duration.*
 
@@ -115,7 +122,15 @@ final class FlightSqlRouter(
       * `metadataFilterRewriter` / `protectedWriteGuard`: `Main` passes the leading arguments
       * positionally.
       */
-    val adminExecutor: Option[ai.starlake.quack.edge.admin.AdminStatementExecutor] = None
+    val adminExecutor: Option[ai.starlake.quack.edge.admin.AdminStatementExecutor] = None,
+    /** Whether a node accepts connections, asked only while a resume hold waits for a woken pool: a
+      * local node counts as routable as soon as its process is launched, before `quack_serve`
+      * listens, so a hold that ended on `routable` alone sent the statement to a closed port.
+      * Always true by default (specs with fake nodes); `Main` wires
+      * [[FlightSqlRouter.tcpAccepting]]. TAIL param for the same reason as
+      * `metadataFilterRewriter`.
+      */
+    val nodeAccepting: ai.starlake.quack.model.RunningNode => IO[Boolean] = _ => IO.pure(true)
 ):
 
   /** Record a statement outcome into history, metrics, and (selectively) the audit journal:
@@ -347,17 +362,18 @@ final class FlightSqlRouter(
         */
       adminDispatch: Boolean = true,
       /** Audit origin recorded on denial and write events and on the SessionOpened module event:
-        * `"flightsql"` for the raw wire, `"quack"` for the native Quack front door. Independent of
-        * `edge` below: metering and audit must not move when a caller only wants to tag the OPA
-        * input differently.
+        * `"flightsql"` for the raw wire, `"quack"` for the native Quack front door, `"rest-data"`
+        * for the REST data edge (through the routed executor). Independent of `edge` below:
+        * metering and audit must not move when a caller only wants to tag the OPA input
+        * differently.
         */
       source: String = "flightsql",
       /** OPA `client.edge`, forwarded to [[executeWith]]'s `ValidationContext.edge` ONLY. Empty
         * (the default) means "same as `source`" -- resolved in [[executeWith]], not here: a
-        * parameter default cannot reference a sibling parameter of the same list in Scala. Main's
-        * routed executor passes `edge = "mcp"` while leaving `source` at its own default so REST
-        * preview / data diff / restore / undrop / branch counts keep reporting "flightsql" for
-        * metering and audit.
+        * parameter default cannot reference a sibling parameter of the same list in Scala. The
+        * routed executor passes its caller's `edge` (`"mcp"` unless the caller names another) while
+        * leaving `source` at the caller's own, so REST preview / data diff / restore / undrop /
+        * branch counts keep reporting "flightsql" for metering and audit.
         */
       edge: String = ""
   ): IO[Either[RouterFailure, QueryResult]] =
@@ -419,9 +435,9 @@ final class FlightSqlRouter(
     * through [[execute]].
     *
     * `source` is the audit origin recorded on denial and write events and on the SessionOpened
-    * module event (`"flightsql"` or `"quack"`). `edge` is the OPA `client.edge` value used ONLY for
-    * `ValidationContext.edge`; empty (the default) means "same as `source`" and is otherwise
-    * independent of it (see `execute`'s scaladoc).
+    * module event (`"flightsql"`, `"quack"` or `"rest-data"`). `edge` is the OPA `client.edge`
+    * value used ONLY for `ValidationContext.edge`; empty (the default) means "same as `source`" and
+    * is otherwise independent of it (see `execute`'s scaladoc).
     *
     * `clientDataScans` is set by the native Quack front door alone, the one caller that relays
     * SEND_DATA on the statement's node connection; it lets a DuckDB 2.0 client's
@@ -526,24 +542,17 @@ final class FlightSqlRouter(
     val poolMeta   = maybeState.map(_.metastore).getOrElse(Map.empty)
     val kindWire   = maybeState.map(_.kindWire).getOrElse("ducklake")
 
-    def perKindDb: Option[String] = kindWire match
-      case "ducklake" | "duckdb-file" =>
-        Option(TenantDb.catalogAlias(poolMeta)).filter(_.nonEmpty)
-      case "memory" => Some("memory")
-      case _        => None
-
-    def perKindSchema: Option[String] = kindWire match
-      case "ducklake" | "duckdb-file" => poolMeta.get("schemaName").filter(_.nonEmpty)
-      case "memory"                   => Some("main")
-      case _                          => None
-
+    // One resolver for every door (SessionCatalog): the REST edge qualifies its generated names
+    // from the same call, so the catalog validated here is the catalog the node reads.
     val ctx = ValidationContext(
       username = user,
       database = poolKey.toString,
       statement = sql,
       peer = connectionId,
-      defaultDatabase = maybeState.flatMap(_.defaultDatabase).orElse(perKindDb),
-      defaultSchema = maybeState.flatMap(_.defaultSchema).orElse(perKindSchema),
+      defaultDatabase =
+        SessionCatalog.database(kindWire, poolMeta, maybeState.flatMap(_.defaultDatabase)),
+      defaultSchema =
+        SessionCatalog.schema(kindWire, poolMeta, maybeState.flatMap(_.defaultSchema)),
       effectiveSet = effectiveSet,
       attachedCatalogs = attachedCatalogsOf(poolKey),
       poolKey = Some(poolKey),
@@ -878,7 +887,7 @@ final class FlightSqlRouter(
         .flatMap(rewriteRevalidated) match
         case Left(f)         => IO.pure(Left(f))
         case Right(finalSql) =>
-          resolveSnapshot(poolKey).flatMap {
+          resolveSnapshot(poolKey, kind).flatMap {
             case Left(f: RouterFailure.NotFound) =>
               if s.txOpen then sessions.invalidatePin(connectionId)
               maybeRecord(nodeId = "-", durationMs = 0, status = "no-pool", error = None)
@@ -1150,28 +1159,49 @@ final class FlightSqlRouter(
       case _ => sql
 
   /** Resolve the routing snapshot, waking a suspended (never a disabled) pool first: fire
-    * resumePool then poll for a routable node, bounded by resumeHoldTimeout; expiry yields the
-    * retryable "pool is resuming" UNAVAILABLE. resumePool errors are swallowed (.attempt):
-    * reconcile retries the spawn and the poll either sees a node or times out.
+    * resumePool then poll for a routable node eligible for `kind` that accepts connections
+    * ([[nodeAccepting]]), until resumeHoldTimeout has passed on the monotonic clock (the probes'
+    * own time counts against it); expiry yields the retryable "pool is resuming" UNAVAILABLE. The
+    * eligible nodes are probed at once, and the snapshot handed to the router holds only those that
+    * accepted: a node still starting would otherwise be picked and fail its connect. resumePool
+    * errors are swallowed (.attempt): reconcile retries the spawn and the poll either sees a node
+    * or times out.
     */
-  private def resolveSnapshot(poolKey: PoolKey): IO[Either[RouterFailure, PoolSnapshot]] =
+  private def resolveSnapshot(
+      poolKey: PoolKey,
+      kind: StatementKind
+  ): IO[Either[RouterFailure, PoolSnapshot]] =
     supervisor.get(poolKey) match
       case None => IO.pure(Left(RouterFailure.NotFound(s"pool not found: $poolKey")))
       case Some(st) if st.suspended && !st.disabled =>
         // IO.defer is load-bearing: without it the snapshot check (and the recursive
         // poll construction) would run eagerly, BEFORE resumePool executes, and the
         // whole chain would pre-resolve to the timeout against the still-empty pool.
-        def poll(remaining: FiniteDuration): IO[Either[RouterFailure, PoolSnapshot]] =
+        def poll(deadline: FiniteDuration): IO[Either[RouterFailure, PoolSnapshot]] =
           IO.defer {
             supervisor.snapshot(poolKey) match
-              case Some(snap) if snap.nodes.exists(n => snap.loadOf(n.nodeId).routable) =>
-                IO.pure(Right(snap))
-              case _ if remaining <= Duration.Zero =>
-                IO.pure(Left(RouterFailure.Unavailable("pool is resuming, retry shortly")))
-              case _ =>
-                IO.sleep(resumePollInterval) *> poll(remaining - resumePollInterval)
+              case Some(snap) =>
+                val routable = snap.nodes.filter(n => snap.loadOf(n.nodeId).routable)
+                val roles    =
+                  RoleMatcher.fallback(kind, routable.map(_.role).toSet)
+                routable
+                  .filter(n => roles.contains(n.role))
+                  .parTraverse(n => nodeAccepting(n).map(n -> _))
+                  .flatMap { probed =>
+                    val accepting = probed.collect { case (n, true) => n }
+                    if accepting.nonEmpty then IO.pure(Right(snap.copy(nodes = accepting)))
+                    else retry(deadline)
+                  }
+              case None => retry(deadline)
           }
-        supervisor.resumePool(poolKey, "query").attempt *> poll(resumeHoldTimeout)
+        def retry(deadline: FiniteDuration): IO[Either[RouterFailure, PoolSnapshot]] =
+          IO.monotonic.flatMap { now =>
+            if now >= deadline then
+              IO.pure(Left(RouterFailure.Unavailable("pool is resuming, retry shortly")))
+            else IO.sleep(resumePollInterval.min(deadline - now)) *> poll(deadline)
+          }
+        supervisor.resumePool(poolKey, "query").attempt *>
+          IO.monotonic.flatMap(now => poll(now + resumeHoldTimeout))
       case Some(_) =>
         supervisor.snapshot(poolKey) match
           case None       => IO.pure(Left(RouterFailure.NotFound(s"pool not found: $poolKey")))
@@ -1248,6 +1278,22 @@ object FlightSqlRouter:
     * set them.
     */
   val ReservedAuditKeys: Set[String] = Set("sql", "denied", "reason", "durationMs")
+
+  /** [[FlightSqlRouter.nodeAccepting]] in production: a TCP connect to the node's port, bounded by
+    * `timeout`. The spawn script runs `quack_serve` last, after every ATTACH, so a node that
+    * accepts a connection is one that can serve its catalog.
+    */
+  def tcpAccepting(timeout: FiniteDuration = 250.millis)(
+      n: ai.starlake.quack.model.RunningNode
+  ): IO[Boolean] =
+    IO.blocking {
+      val s = new java.net.Socket()
+      try
+        s.connect(new java.net.InetSocketAddress(n.host, n.port), timeout.toMillis.toInt)
+        true
+      catch case _: java.io.IOException => false
+      finally s.close()
+    }
 
   /** One node call for [[FlightSqlRouter.executeWith]]: `(node, wrappedSql, stampPrelude,
     * recordLoad) => outcome`. Implementations must book load through

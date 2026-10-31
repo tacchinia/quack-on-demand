@@ -37,7 +37,8 @@ object ConfigRegistry:
       validationCls: Class[?],
       metricsCls: Class[?],
       quackCls: Class[?] = classOf[ai.starlake.quack.QuackNativeConfig],
-      opaCls: Class[?] = classOf[ai.starlake.quack.edge.config.OpaConfig]
+      opaCls: Class[?] = classOf[ai.starlake.quack.edge.config.OpaConfig],
+      restCls: Class[?] = classOf[ai.starlake.quack.RestEdgeConfig]
   ): List[(String, Class[?])] = List(
     "quack-on-demand"            -> managerCls,
     "quack-on-demand.metrics"    -> metricsCls,
@@ -46,7 +47,8 @@ object ConfigRegistry:
     "quack-flightsql.validation" -> validationCls,
     "quack-flightsql.acl"        -> aclCls,
     "quack-flightsql.opa"        -> opaCls,
-    "quack-native"               -> quackCls
+    "quack-native"               -> quackCls,
+    "quack-rest"                 -> restCls
   )
 
   /** Build the full registry by reflecting through `roots`. */

@@ -15,6 +15,7 @@ import ai.starlake.quack.model.{
   Role,
   RoleDistribution,
   RunningNode,
+  SessionCatalog,
   Tenant,
   TenantDbKind
 }
@@ -798,6 +799,138 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
         router.execute("d-3", "alice", key, "SELECT 1").unsafeRunSync()
         capturer.lastCtx.defaultDatabase shouldBe Some("delta_lake")
         capturer.lastCtx.defaultSchema shouldBe Some("myschema")
+
+  // The session catalog the validator sees is the one SessionCatalog resolves for the pool, for
+  // every kind and metastore shape. The REST edge qualifies its generated names from the same
+  // resolver; if the router derived the catalog on its own, the ACL could validate one catalog
+  // while the node read another.
+  it should "resolve the validation defaults through SessionCatalog for every kind and shape" in:
+    val admin = new ai.starlake.quack.ondemand.state.DbAdmin:
+      def createDatabase(name: String): Either[String, Unit] = Right(())
+      def dropDatabase(name: String): Either[String, Unit]   = Right(())
+    val backend = new QuackBackend:
+      private val n          = TrieMap.empty[String, RunningNode]
+      def start(s: NodeSpec) = IO {
+        val r = RunningNode(
+          s.nodeId,
+          s.poolKey,
+          s.role,
+          "127.0.0.1",
+          25500 + n.size,
+          "tok",
+          Some(6L),
+          None,
+          Instant.EPOCH,
+          maxConcurrent = s.maxConcurrent
+        )
+        n.put(s.nodeId, r); r
+      }
+      def stop(key: PoolKey, id: String) = IO { n.remove(id); () }
+      def isAlive(id: String)            = n.contains(id)
+      def discoverExisting()             = IO.pure(n.values.toList)
+      def cleanup()                      = IO(n.clear())
+    val sup = new PoolSupervisor(
+      backend,
+      new NodeLoadTracker,
+      new InMemoryControlPlaneStore(),
+      dbAdmin = admin
+    )
+    sup.createTenant(Tenant("zeta")).unsafeRunSync()
+    // DuckLake pre-init against pgPort 0 fails fast and is swallowed by design (see the schema
+    // skew test below), so no live Postgres is needed for the ducklake shapes.
+    val pg = Map("pgHost" -> "127.0.0.1", "pgPort" -> "0", "pgUser" -> "u", "pgPassword" -> "p")
+    final case class Shape(
+        suffix: String,
+        kind: TenantDbKind,
+        metastore: Map[String, String],
+        dataPath: String,
+        defaultDatabase: Option[String],
+        expectedDb: Option[String],
+        expectedSchema: Option[String]
+    )
+    val shapes = List(
+      Shape("mem", TenantDbKind.InMemory, Map.empty, "", None, Some("memory"), Some("main")),
+      Shape(
+        "memov",
+        TenantDbKind.InMemory,
+        Map.empty,
+        "",
+        Some("fedpg"),
+        Some("fedpg"),
+        Some("main")
+      ),
+      Shape(
+        "file",
+        TenantDbKind.DuckDbFile,
+        Map("dbName" -> "zeta_file", "schemaName" -> "main"),
+        "/tmp/qod-session-catalog.duckdb",
+        None,
+        Some("zeta_file"),
+        Some("main")
+      ),
+      Shape(
+        "filealias",
+        TenantDbKind.DuckDbFile,
+        Map("dbName" -> "zeta_filealias", "schemaName" -> "main", "catalogAlias" -> "zeta_parent"),
+        "/tmp/qod-session-catalog-alias.duckdb",
+        None,
+        Some("zeta_parent"),
+        Some("main")
+      ),
+      Shape(
+        "lake",
+        TenantDbKind.DuckLake,
+        pg + ("schemaName" -> "curated"),
+        "/tmp/qod-session-catalog-lake",
+        None,
+        Some("zeta_lake"),
+        Some("curated")
+      ),
+      Shape(
+        "lakealias",
+        TenantDbKind.DuckLake,
+        pg ++ Map("schemaName" -> "main", "catalogAlias" -> "zeta_lake"),
+        "/tmp/qod-session-catalog-lake-alias",
+        None,
+        Some("zeta_lake"),
+        Some("main")
+      )
+    )
+    val capturer = new CapturingValidator
+    val client   = new QuackHttpClient(TestArrow.sharedAllocator):
+      override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
+        IO.pure(TestArrow.okResponse())
+    val router = new FlightSqlRouter(
+      sup,
+      new SessionRegistry,
+      new NodeLoadTracker,
+      new QuackHttpAdapter(client, new NodeLoadTracker),
+      validator = capturer
+    )
+    shapes.foreach { s =>
+      withClue(s"${s.suffix}: ") {
+        sup
+          .createTenantDb(
+            tenantName = "zeta",
+            suffix = s.suffix,
+            kind = s.kind,
+            metastore = s.metastore,
+            dataPath = s.dataPath,
+            defaultDatabase = s.defaultDatabase
+          )
+          .unsafeRunSync() shouldBe a[Right[?, ?]]
+        val key = PoolKey("zeta", s"zeta_${s.suffix}", s"p${s.suffix}")
+        sup.createPool(key, RoleDistribution(0, 0, 1)).unsafeRunSync()
+        router.execute(s"session-catalog-${s.suffix}", "alice", key, "SELECT 1").unsafeRunSync()
+        val st = sup.get(key).get
+        capturer.lastCtx.defaultDatabase shouldBe
+          SessionCatalog.database(st.kindWire, st.metastore, st.defaultDatabase)
+        capturer.lastCtx.defaultSchema shouldBe
+          SessionCatalog.schema(st.kindWire, st.metastore, st.defaultSchema)
+        capturer.lastCtx.defaultDatabase shouldBe s.expectedDb
+        capturer.lastCtx.defaultSchema shouldBe s.expectedSchema
+      }
+    }
 
   // KNOWN GAP (ignored below): validator-vs-engine default-schema skew.
   //
@@ -2607,6 +2740,15 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
         se.pool shouldBe poolKey.pool
       case other => fail(s"expected StatementExecuted, got $other")
 
+  it should "emit SessionOpened under the source the caller of execute names" in:
+    val received               = new java.util.concurrent.CopyOnWriteArrayList[ManagerEvent]()
+    val sink: ManagerEventSink = e => { received.add(e); () }
+    val (router, _, _)         = setup(events = sink)
+    router.execute("evt-src", "alice", poolKey, "SELECT 1", source = "rest-data").unsafeRunSync()
+    received.toArray.toList.collect { case ManagerEvent.SessionOpened(_, u, via) =>
+      (u, via)
+    } shouldBe List(("alice", "rest-data"))
+
   it should "emit StatementExecuted with ok=false when execution fails" in:
     val denying = new StatementValidator:
       def validate(ctx: ValidationContext): ValidationResult = Denied("you can't read this")
@@ -2648,7 +2790,11 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
   private def setupWithSupervisor(
       failResumeStarts: Boolean = false,
       resumeHoldTimeout: FiniteDuration = 60.seconds,
-      resumePollInterval: FiniteDuration = 250.millis
+      resumePollInterval: FiniteDuration = 250.millis,
+      nodeAccepting: RunningNode => IO[Boolean] = _ => IO.pure(true),
+      distribution: RoleDistribution = RoleDistribution(0, 0, 1),
+      /** The endpoints the statements were sent to. */
+      sent: scala.collection.mutable.ListBuffer[String] = scala.collection.mutable.ListBuffer.empty
   ) =
     val failStart = new java.util.concurrent.atomic.AtomicBoolean(false)
     val backend   = new QuackBackend:
@@ -2682,12 +2828,12 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     sup
       .createTenantDb(poolKey.tenant, poolKey.tenantDb, TenantDbKind.InMemory, Map.empty, "")
       .unsafeRunSync()
-    sup.createPool(poolKey, RoleDistribution(0, 0, 1)).unsafeRunSync()
+    sup.createPool(poolKey, distribution).unsafeRunSync()
     if failResumeStarts then failStart.set(true)
 
     val client = new QuackHttpClient(TestArrow.sharedAllocator):
       override def query(endpoint: String, token: String, sql: String, session: Option[String]) =
-        IO.pure(TestArrow.okResponse())
+        IO(sent.synchronized(sent += endpoint)) *> IO.pure(TestArrow.okResponse())
     val adapter = new QuackHttpAdapter(client, tracker)
     val router  = new FlightSqlRouter(
       sup,
@@ -2696,7 +2842,8 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
       adapter,
       stmtInstruments = si,
       resumeHoldTimeout = resumeHoldTimeout,
-      resumePollInterval = resumePollInterval
+      resumePollInterval = resumePollInterval,
+      nodeAccepting = nodeAccepting
     )
     (router, sup)
 
@@ -2724,6 +2871,75 @@ class FlightSqlRouterSpec extends AnyFlatSpec with Matchers:
     r match
       case Left(RouterFailure.Unavailable(msg)) => msg should include("resuming")
       case other => fail(s"expected Unavailable('pool is resuming...'), got $other")
+
+  it should "hold until the woken node accepts connections" in:
+    // A local node is routable once launched, before `quack_serve` listens.
+    val asked         = new java.util.concurrent.atomic.AtomicInteger(0)
+    val (router, sup) = setupWithSupervisor(
+      resumePollInterval = 20.millis,
+      nodeAccepting = _ => IO(asked.incrementAndGet() >= 3)
+    )
+    sup.suspendPool(poolKey, "rest").unsafeRunSync()
+    val r = router
+      .execute("wake-5", "alice", poolKey, "SELECT 1", recordExecution = true)
+      .unsafeRunSync()
+    r.isRight shouldBe true
+    asked.get() shouldBe 3
+
+  it should "time out with a retryable error when the woken node never accepts" in:
+    val (router, sup) = setupWithSupervisor(
+      resumeHoldTimeout = 300.millis,
+      resumePollInterval = 50.millis,
+      nodeAccepting = _ => IO.pure(false)
+    )
+    sup.suspendPool(poolKey, "rest").unsafeRunSync()
+    router
+      .execute("wake-6", "alice", poolKey, "SELECT 1", recordExecution = true)
+      .unsafeRunSync() match
+      case Left(RouterFailure.Unavailable(msg)) => msg should include("resuming")
+      case other => fail(s"expected Unavailable('pool is resuming...'), got $other")
+
+  it should "send the statement to a woken node that accepts, not to one still starting" in:
+    val sent          = scala.collection.mutable.ListBuffer.empty[String]
+    val (router, sup) = setupWithSupervisor(
+      resumePollInterval = 20.millis,
+      nodeAccepting = n => IO.pure(n.port == 28001),
+      distribution = RoleDistribution(0, 0, 2),
+      sent = sent
+    )
+    sup.suspendPool(poolKey, "rest").unsafeRunSync()
+    router
+      .execute("wake-7", "alice", poolKey, "SELECT 1", recordExecution = true)
+      .unsafeRunSync()
+      .isRight shouldBe true
+    sent.toList match
+      case List(endpoint) => endpoint should include(":28001")
+      case other          => fail(s"expected one statement, sent to $other")
+
+  it should "count the time its connection probes take against the hold" in:
+    val (router, sup) = setupWithSupervisor(
+      resumeHoldTimeout = 300.millis,
+      resumePollInterval = 50.millis,
+      nodeAccepting = _ => IO.sleep(200.millis).as(false),
+      distribution = RoleDistribution(0, 0, 2)
+    )
+    sup.suspendPool(poolKey, "rest").unsafeRunSync()
+    val start = System.nanoTime()
+    router
+      .execute("wake-8", "alice", poolKey, "SELECT 1", recordExecution = true)
+      .unsafeRunSync() shouldBe a[Left[?, ?]]
+    // Two nodes probed at once, each probe 200 ms: about 300 ms plus one probe, never one per
+    // node per poll on top of the interval.
+    (System.nanoTime() - start).nanos should be < 1.second
+
+  "tcpAccepting" should "tell a listening port from a closed one" in:
+    val server = new java.net.ServerSocket(0)
+    val node   = RunningNode(
+      "n", poolKey, Role.Dual, "127.0.0.1", server.getLocalPort, "tok", None, None, Instant.EPOCH
+    )
+    try FlightSqlRouter.tcpAccepting()(node).unsafeRunSync() shouldBe true
+    finally server.close()
+    FlightSqlRouter.tcpAccepting()(node).unsafeRunSync() shouldBe false
 
   it should "not wake a disabled pool" in:
     val (router, sup) = setupWithSupervisor()
